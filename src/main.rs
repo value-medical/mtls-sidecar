@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+mod config;
 mod proxy;
 mod tls_manager;
 
@@ -19,16 +20,35 @@ async fn main() -> Result<()> {
         .json()
         .init();
 
+    // Load config
+    let config = config::Config::from_env();
+    tracing::info!(
+        "Config loaded: port={}, upstream={}, cert_dir={}, ca_dir={}",
+        config.tls_listen_port,
+        config.upstream_url,
+        config.cert_dir,
+        config.ca_dir
+    );
+
     // Create TlsManager
-    let tls_manager = Arc::new(TlsManager::new("/etc/certs", "/etc/ca").await?);
+    let tls_manager = Arc::new(
+        TlsManager::new(&config)
+            .await
+            .context("Failed to load TLS config")?,
+    );
     tracing::info!("TLS loaded");
 
-    // Bind to port 8443
-    let listener = TcpListener::bind("0.0.0.0:8443").await?;
+    // Bind to configured port
+    let addr = format!("0.0.0.0:{}", config.tls_listen_port);
+    let listener = TcpListener::bind(&addr)
+        .await
+        .context(format!("Failed to bind to {}", addr))?;
 
+    let upstream_url = config.upstream_url.clone();
     loop {
         let (stream, _) = listener.accept().await?;
         let tls_manager = Arc::clone(&tls_manager);
+        let upstream = upstream_url.clone();
 
         tokio::spawn(async move {
             let acceptor = TlsAcceptor::from(Arc::clone(&tls_manager.config));
@@ -45,7 +65,8 @@ async fn main() -> Result<()> {
                 if let Some(cert) = &client_cert {
                     req.extensions_mut().insert(cert.clone());
                 }
-                async move { proxy::handler(req).await }
+                let up = upstream.clone();
+                async move { proxy::handler(req, &up).await }
             });
 
             if let Err(err) = http1::Builder::new()
