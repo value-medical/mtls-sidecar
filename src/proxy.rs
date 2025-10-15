@@ -5,7 +5,7 @@ use hyper::{body::Body, Request, Response, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
-pub async fn handler<B>(req: Request<B>) -> Result<Response<Full<Bytes>>>
+pub async fn handler<B>(req: Request<B>, upstream_url: &str) -> Result<Response<Full<Bytes>>>
 where
     B: Body + Send + Unpin + 'static,
     B::Data: Send,
@@ -27,7 +27,6 @@ where
 
     // Forward to upstream
     let client = Client::builder(TokioExecutor::new()).build_http();
-    let upstream_url = "http://localhost:8080";
 
     let method = parts.method.clone();
     let uri = parts.uri.clone();
@@ -46,10 +45,11 @@ where
     }
 
     // Set host header
+    let host_port = upstream_url.strip_prefix("http://").unwrap_or(upstream_url);
     upstream_req_builder
         .headers_mut()
         .unwrap()
-        .insert("host", "localhost:8080".parse().unwrap());
+        .insert("host", host_port.parse().unwrap());
 
     let upstream_req = upstream_req_builder.body(body).unwrap();
 
@@ -75,7 +75,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_missing_cert() {
         let req = Request::new(Empty::<Bytes>::new());
-        let resp = handler(req).await.unwrap();
+        let resp = handler(req, "http://localhost:8080").await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

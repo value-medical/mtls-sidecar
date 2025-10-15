@@ -58,13 +58,21 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
     });
 
     // Start sidecar on 8443
-    let tls_manager =
-        Arc::new(TlsManager::new(cert_dir.to_str().unwrap(), ca_dir.to_str().unwrap()).await?);
+    let config = mtls_sidecar::config::Config {
+        tls_listen_port: 8443,
+        upstream_url: "http://127.0.0.1:8080".to_string(),
+        upstream_readiness_url: "http://127.0.0.1:8080/ready".to_string(),
+        cert_dir: cert_dir.to_str().unwrap().to_string(),
+        ca_dir: ca_dir.to_str().unwrap().to_string(),
+    };
+    let tls_manager = Arc::new(TlsManager::new(&config).await?);
     let sidecar_listener = TcpListener::bind("127.0.0.1:8443").await?;
+    let upstream_url = config.upstream_url.clone();
     tokio::spawn(async move {
         loop {
             let (stream, _) = sidecar_listener.accept().await.unwrap();
             let tls_manager = Arc::clone(&tls_manager);
+            let upstream = upstream_url.clone();
             tokio::spawn(async move {
                 let acceptor = TlsAcceptor::from(Arc::clone(&tls_manager.config));
                 let stream = acceptor.accept(stream).await.unwrap();
@@ -76,7 +84,8 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
                     if let Some(cert) = &client_cert {
                         req.extensions_mut().insert(cert.clone());
                     }
-                    async move { mtls_sidecar::proxy::handler(req).await }
+                    let up = upstream.clone();
+                    async move { mtls_sidecar::proxy::handler(req, &up).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
