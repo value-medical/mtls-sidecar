@@ -45,10 +45,12 @@ async fn main() -> Result<()> {
         .context(format!("Failed to bind to {}", addr))?;
 
     let upstream_url = config.upstream_url.clone();
+    let inject_headers = config.inject_client_headers;
     loop {
         let (stream, _) = listener.accept().await?;
         let tls_manager = Arc::clone(&tls_manager);
         let upstream = upstream_url.clone();
+        let inject = inject_headers;
 
         tokio::spawn(async move {
             let acceptor = TlsAcceptor::from(Arc::clone(&tls_manager.config));
@@ -66,7 +68,8 @@ async fn main() -> Result<()> {
                     req.extensions_mut().insert(cert.clone());
                 }
                 let up = upstream.clone();
-                async move { proxy::handler(req, &up).await }
+                let inj = inject;
+                async move { proxy::handler(req, &up, inj).await }
             });
 
             if let Err(err) = http1::Builder::new()
