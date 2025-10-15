@@ -4,8 +4,13 @@ use http_body_util::{BodyExt, Full};
 use hyper::{body::Body, Request, Response, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use x509_parser::prelude::*;
 
-pub async fn handler<B>(req: Request<B>, upstream_url: &str) -> Result<Response<Full<Bytes>>>
+pub async fn handler<B>(
+    req: Request<B>,
+    upstream_url: &str,
+    inject_client_headers: bool,
+) -> Result<Response<Full<Bytes>>>
 where
     B: Body + Send + Unpin + 'static,
     B::Data: Send,
@@ -35,6 +40,26 @@ where
     let mut upstream_req_builder = Request::builder()
         .method(method.clone())
         .uri(format!("{}{}", upstream_url, uri));
+
+    // If inject_client_headers, parse cert and add headers
+    if inject_client_headers {
+        if let Some(cert_der) = client_cert {
+            if let Ok((_, cert)) = X509Certificate::from_der(cert_der.as_ref()) {
+                let subject = cert.subject().to_string();
+                let cn = cert
+                    .subject()
+                    .iter_common_name()
+                    .next()
+                    .and_then(|cn| cn.as_str().ok())
+                    .unwrap_or("");
+
+                upstream_req_builder = upstream_req_builder
+                    .header("X-Client-CN", cn)
+                    .header("X-Client-Subject", subject);
+                tracing::info!("Injected client headers");
+            }
+        }
+    }
 
     // Copy headers
     for (key, value) in &parts.headers {
@@ -71,11 +96,36 @@ where
 mod tests {
     use super::*;
     use http_body_util::Empty;
+    use rcgen::{CertificateParams, DnType, KeyPair};
 
     #[tokio::test]
     async fn test_handler_missing_cert() {
         let req = Request::new(Empty::<Bytes>::new());
-        let resp = handler(req, "http://localhost:8080").await.unwrap();
+        let resp = handler(req, "http://localhost:8080", false).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_handler_with_cert_no_injection() {
+        // Create a mock cert
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "test-client");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "Test Org");
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+
+        let mut req = Request::new(Empty::<Bytes>::new());
+        req.extensions_mut().insert(cert_der);
+
+        // Since upstream is not running, it will fail, but we can check if it tries to connect
+        // For this test, just ensure it doesn't return UNAUTHORIZED
+        let result = handler(req, "http://localhost:8080", false).await;
+        // It should try to proxy and fail with connection error, not UNAUTHORIZED
+        assert!(result.is_err()); // Since no upstream
     }
 }

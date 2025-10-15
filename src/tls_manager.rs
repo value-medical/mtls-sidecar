@@ -167,6 +167,7 @@ mod tests {
             upstream_readiness_url: "http://localhost:8080/ready".to_string(),
             cert_dir: cert_dir.to_str().unwrap().to_string(),
             ca_dir: ca_dir.to_str().unwrap().to_string(),
+            inject_client_headers: false,
         };
         let result = TlsManager::new(&config).await;
         assert!(result.is_ok());
@@ -192,6 +193,7 @@ mod tests {
             upstream_readiness_url: "http://localhost:8080/ready".to_string(),
             cert_dir: cert_dir.to_str().unwrap().to_string(),
             ca_dir: ca_dir.to_str().unwrap().to_string(),
+            inject_client_headers: false,
         };
         let result = TlsManager::new(&config).await;
         assert!(result.is_err());
