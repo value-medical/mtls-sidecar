@@ -3,6 +3,9 @@ name = "mtls-sidecar"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "mtls_sidecar"
+
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
 rustls = "0.23"
@@ -22,6 +25,7 @@ tokio-test = "0.4"
 tempfile = "3.23"
 rcgen = "0.13"
 time = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [profile.release]
 lto = true

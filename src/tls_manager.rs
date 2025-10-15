@@ -79,6 +79,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_tls_manager_new_with_valid_certs() {
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).unwrap();
+
         let temp_dir = TempDir::new().unwrap();
         let cert_dir = temp_dir.path().join("certs");
         let ca_dir = temp_dir.path().join("ca");
