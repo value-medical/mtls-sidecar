@@ -75,12 +75,14 @@ Use Rust 1.90+ and Cargo. The `Cargo.toml` should define a binary crate with the
 
 - `tokio = { version = "1.48", features = ["full"] }` for async runtime.
 - `rustls = "0.23"` and `rustls-pemfile = "2.1"` for TLS and PEM parsing.
-- `hyper = { version = "1.7", features = ["full"] }` and `hyper-rustls = "0.27"` for HTTP and TLS integration.
+- `tokio-rustls = "0.26"` for TLS stream handling.
+- `hyper = { version = "1.7", features = ["full"] }`, `hyper-rustls = "0.27"`, and `hyper-util = { version = "0.1", features = ["tokio"] }` for HTTP and TLS integration.
+- `http-body-util = "0.1"` for HTTP body utilities.
 - `tracing = "0.1"` and `tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }` for structured
   logging.
 - `anyhow = "1.0"` for error chaining.
 
-For dev: `tokio-test = "0.4"` and `tempfile = "3.23"`.
+For dev: `tokio-test = "0.4"`, `tempfile = "3.23"`, `rcgen = "0.13"` for test certificate generation, `time = "0.3"` for certificate validity periods, and `bytes = "1.0"` for byte buffers.
 
 Set `[profile.release] lto = true` and `codegen-units = 1` for optimization.
 
@@ -130,9 +132,9 @@ Implement basic TLS server setup in `tls_manager.rs` and `main.rs`.
     - Read certs from `/etc/certs/tls.crt` + `/etc/certs/tls.key`
     - Read CA bundle from `/etc/ca/ca-bundle.pem`.
 - Define a `TlsManager` struct with an `Arc<rustls::ServerConfig>` field.
-- In `TlsManager::new()`, read and parse PEM files using `rustls-pemfile`; build a `rustls::ServerConfig` with safe
+- In `TlsManager::new(cert_dir: &str, ca_dir: &str)`, read and parse PEM files using `rustls-pemfile`; build a `rustls::ServerConfig` with safe
   defaults, client auth requiring verification, and a custom CA pool from the bundle.
-- In `main.rs`, spawn a Hyper server with `rustls::acceptor` on the hardcoded port; serve a simple echo handler that
+- In `main.rs`, call `TlsManager::new("/etc/certs", "/etc/ca")`; spawn a Hyper server with `tokio_rustls::TlsAcceptor` on the hardcoded port; serve a simple echo handler that
   returns 200 OK if client cert verified.
 - Add tracing: Log "TLS loaded" on init, "Client connected" on handshake (do not log cert details).
 - Tests:
