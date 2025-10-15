@@ -82,7 +82,8 @@ Use Rust 1.90+ and Cargo. The `Cargo.toml` should define a binary crate with the
   logging.
 - `anyhow = "1.0"` for error chaining.
 
-For dev: `tokio-test = "0.4"`, `tempfile = "3.23"`, `rcgen = "0.13"` for test certificate generation, `time = "0.3"` for certificate validity periods, and `bytes = "1.0"` for byte buffers.
+For dev: `tokio-test = "0.4"`, `tempfile = "3.23"`, `rcgen = "0.13"` for test certificate generation, `time = "0.3"` for certificate validity periods, `bytes = "1.0"` for byte buffers, and `reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }` for integration tests.
+Excluding default features for reqwest is necessary to avoid native-tls dependencies, which conflict with rustls.
 
 Set `[profile.release] lto = true` and `codegen-units = 1` for optimization.
 
