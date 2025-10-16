@@ -7,6 +7,10 @@ use tokio::sync::mpsc;
 
 use crate::tls_manager::TlsManager;
 
+fn should_watch_ca_dir(cert_dir: &str, ca_dir: &str) -> bool {
+    Path::new(ca_dir).exists() && ca_dir != cert_dir
+}
+
 pub async fn start_watcher(
     cert_dir: &str,
     ca_dir: &str,
@@ -19,7 +23,9 @@ pub async fn start_watcher(
     })?;
 
     watcher.watch(Path::new(cert_dir), RecursiveMode::NonRecursive)?;
-    watcher.watch(Path::new(ca_dir), RecursiveMode::NonRecursive)?;
+    if should_watch_ca_dir(cert_dir, ca_dir) {
+        watcher.watch(Path::new(ca_dir), RecursiveMode::NonRecursive)?;
+    }
 
     while let Some(res) = rx.recv().await {
         match res {
@@ -113,5 +119,35 @@ mod tests {
             attrs: Default::default(),
         };
         assert!(!is_relevant_event(&remove_cert));
+    }
+
+    #[test]
+    fn test_should_watch_ca_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let cert_dir = temp_dir.path().join("cert");
+        let ca_dir_existing = temp_dir.path().join("ca");
+        let ca_dir_nonexistent = temp_dir.path().join("nonexistent");
+
+        // Create directories
+        fs::create_dir(&cert_dir).unwrap();
+        fs::create_dir(&ca_dir_existing).unwrap();
+
+        // Test: ca_dir exists and is different from cert_dir
+        assert!(should_watch_ca_dir(
+            cert_dir.to_str().unwrap(),
+            ca_dir_existing.to_str().unwrap()
+        ));
+
+        // Test: ca_dir does not exist
+        assert!(!should_watch_ca_dir(
+            cert_dir.to_str().unwrap(),
+            ca_dir_nonexistent.to_str().unwrap()
+        ));
+
+        // Test: ca_dir is the same as cert_dir
+        assert!(!should_watch_ca_dir(
+            cert_dir.to_str().unwrap(),
+            cert_dir.to_str().unwrap()
+        ));
     }
 }
