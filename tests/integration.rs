@@ -6,6 +6,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use portpicker;
 use rcgen::CertificateParams;
 use rcgen::DnType;
 use rcgen::KeyPair;
@@ -24,6 +25,10 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
+    // Pick dynamic ports
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
+
     // Generate CA, server cert, and client cert
     let (ca_cert, ca_key) = generate_ca();
     let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key);
@@ -40,8 +45,8 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
     std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
 
-    // Start mock upstream on 8080
-    let upstream_listener = TcpListener::bind("127.0.0.1:8080").await?;
+    // Start mock upstream
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
     tokio::spawn(async move {
         loop {
             let (stream, _) = upstream_listener.accept().await.unwrap();
@@ -59,11 +64,11 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
         }
     });
 
-    // Start sidecar on 8443
+    // Start sidecar
     let config = mtls_sidecar::config::Config {
-        tls_listen_port: 8443,
-        upstream_url: "http://127.0.0.1:8080".to_string(),
-        upstream_readiness_url: "http://127.0.0.1:8080/ready".to_string(),
+        tls_listen_port: sidecar_port,
+        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
+        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
         cert_dir: cert_dir.to_str().unwrap().to_string(),
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: false,
@@ -71,7 +76,7 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
         enable_metrics: false,
     };
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind("127.0.0.1:8443").await?;
+    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
     let upstream_url = config.upstream_url.clone();
     tokio::spawn(async move {
         loop {
@@ -113,7 +118,7 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
         )?)
         .build()?;
 
-    let resp = client.get("https://localhost:8443/").send().await?;
+    let resp = client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
     assert_eq!(resp.status(), 200);
     let text = resp.text().await?;
     assert_eq!(text, "Hello from upstream");
@@ -125,6 +130,10 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
 async fn test_proxy_with_header_injection() -> Result<()> {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Pick dynamic ports
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
 
     // Generate CA, server cert, and client cert with CN
     let (ca_cert, ca_key) = generate_ca();
@@ -143,7 +152,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
     std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
 
     // Start mock upstream that echoes headers
-    let upstream_listener = TcpListener::bind("127.0.0.1:8081").await?;
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
     let received_headers = Arc::new(std::sync::Mutex::new(Vec::new()));
     let headers_clone = Arc::clone(&received_headers);
     tokio::spawn(async move {
@@ -172,11 +181,11 @@ async fn test_proxy_with_header_injection() -> Result<()> {
         }
     });
 
-    // Start sidecar on 8444 with injection enabled
+    // Start sidecar with injection enabled
     let config = mtls_sidecar::config::Config {
-        tls_listen_port: 8444,
-        upstream_url: "http://127.0.0.1:8081".to_string(),
-        upstream_readiness_url: "http://127.0.0.1:8081/ready".to_string(),
+        tls_listen_port: sidecar_port,
+        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
+        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
         cert_dir: cert_dir.to_str().unwrap().to_string(),
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: true,
@@ -184,7 +193,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
         enable_metrics: false,
     };
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind("127.0.0.1:8444").await?;
+    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
     let upstream_url = config.upstream_url.clone();
     let inject = config.inject_client_headers;
     tokio::spawn(async move {
@@ -228,7 +237,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
         )?)
         .build()?;
 
-    let resp = client.get("https://localhost:8444/").send().await?;
+    let resp = client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
     assert_eq!(resp.status(), 200);
 
     // Check if headers were received
@@ -295,6 +304,10 @@ async fn test_file_watching_reload() -> Result<()> {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
+    // Pick dynamic ports
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
+
     // Generate initial CA, server cert, and client cert
     let (ca_cert, ca_key) = generate_ca();
     let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key);
@@ -312,7 +325,7 @@ async fn test_file_watching_reload() -> Result<()> {
     std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
 
     // Start mock upstream
-    let upstream_listener = TcpListener::bind("127.0.0.1:8082").await?;
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
     tokio::spawn(async move {
         loop {
             let (stream, _) = upstream_listener.accept().await.unwrap();
@@ -330,9 +343,9 @@ async fn test_file_watching_reload() -> Result<()> {
 
     // Start sidecar
     let config = mtls_sidecar::config::Config {
-        tls_listen_port: 8445,
-        upstream_url: "http://127.0.0.1:8082".to_string(),
-        upstream_readiness_url: "http://127.0.0.1:8082/ready".to_string(),
+        tls_listen_port: sidecar_port,
+        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
+        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
         cert_dir: cert_dir.to_str().unwrap().to_string(),
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: false,
@@ -340,7 +353,7 @@ async fn test_file_watching_reload() -> Result<()> {
         enable_metrics: false,
     };
     let tls_manager = Arc::new(mtls_sidecar::tls_manager::TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind("127.0.0.1:8445").await?;
+    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
     let upstream_url = config.upstream_url.clone();
     let watcher_tls_manager = Arc::clone(&tls_manager);
     let reload_tls_manager = Arc::clone(&tls_manager);
@@ -394,7 +407,7 @@ async fn test_file_watching_reload() -> Result<()> {
             format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
         )?)
         .build()?;
-    let resp = old_client.get("https://localhost:8445/").send().await?;
+    let resp = old_client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
     assert_eq!(resp.status(), 200);
 
     // Generate new certs
@@ -423,7 +436,7 @@ async fn test_file_watching_reload() -> Result<()> {
         )?)
         .build()?;
     let result = old_client_permissive
-        .get("https://localhost:8445/")
+        .get(format!("https://localhost:{}/", sidecar_port))
         .send()
         .await;
     assert!(
@@ -446,7 +459,7 @@ async fn test_file_watching_reload() -> Result<()> {
         )?)
         .build()?;
 
-    let resp = new_client.get("https://localhost:8445/").send().await?;
+    let resp = new_client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
     assert_eq!(resp.status(), 200);
 
     Ok(())
@@ -456,6 +469,10 @@ async fn test_file_watching_reload() -> Result<()> {
 async fn test_tls_handshake_failure_handling() -> Result<()> {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Pick dynamic ports
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
 
     // Generate CA and server cert
     let (ca_cert, ca_key) = generate_ca();
@@ -473,7 +490,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
 
     // Start mock upstream
-    let upstream_listener = TcpListener::bind("127.0.0.1:8083").await?;
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
     tokio::spawn(async move {
         loop {
             let (stream, _) = upstream_listener.accept().await.unwrap();
@@ -491,9 +508,9 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
 
     // Start sidecar
     let config = mtls_sidecar::config::Config {
-        tls_listen_port: 8446,
-        upstream_url: "http://127.0.0.1:8083".to_string(),
-        upstream_readiness_url: "http://127.0.0.1:8083/ready".to_string(),
+        tls_listen_port: sidecar_port,
+        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
+        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
         cert_dir: cert_dir.to_str().unwrap().to_string(),
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: false,
@@ -501,7 +518,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
         enable_metrics: false,
     };
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind("127.0.0.1:8446").await?;
+    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
     let upstream_url = config.upstream_url.clone();
     tokio::spawn(async move {
         loop {
@@ -545,7 +562,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     let invalid_client = reqwest::Client::builder()
         .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
         .build()?;
-    let result = invalid_client.get("https://localhost:8446/").send().await;
+    let result = invalid_client.get(format!("https://localhost:{}/", sidecar_port)).send().await;
     assert!(
         result.is_err(),
         "Connection without client cert should fail"
@@ -558,7 +575,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
             format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
         )?)
         .build()?;
-    let resp = valid_client.get("https://localhost:8446/").send().await?;
+    let resp = valid_client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
     assert_eq!(resp.status(), 200);
 
     Ok(())
@@ -568,6 +585,10 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
 async fn test_proxy_large_response() -> Result<()> {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Pick dynamic ports
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
 
     // Generate CA, server cert, and client cert
     let (ca_cert, ca_key) = generate_ca();
@@ -588,8 +609,8 @@ async fn test_proxy_large_response() -> Result<()> {
     // Create large response body (10MB)
     let large_body = Bytes::from(vec![b'A'; 10_000_000]);
 
-    // Start mock upstream on 8084
-    let upstream_listener = TcpListener::bind("127.0.0.1:8084").await?;
+    // Start mock upstream
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
     let body_clone = large_body.clone();
     tokio::spawn(async move {
         loop {
@@ -608,11 +629,11 @@ async fn test_proxy_large_response() -> Result<()> {
         }
     });
 
-    // Start sidecar on 8447
+    // Start sidecar
     let config = mtls_sidecar::config::Config {
-        tls_listen_port: 8447,
-        upstream_url: "http://127.0.0.1:8084".to_string(),
-        upstream_readiness_url: "http://127.0.0.1:8084/ready".to_string(),
+        tls_listen_port: sidecar_port,
+        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
+        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
         cert_dir: cert_dir.to_str().unwrap().to_string(),
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: false,
@@ -620,7 +641,7 @@ async fn test_proxy_large_response() -> Result<()> {
         enable_metrics: false,
     };
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind("127.0.0.1:8447").await?;
+    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
     let upstream_url = config.upstream_url.clone();
     tokio::spawn(async move {
         loop {
@@ -662,7 +683,7 @@ async fn test_proxy_large_response() -> Result<()> {
         )?)
         .build()?;
 
-    let resp = client.get("https://localhost:8447/").send().await?;
+    let resp = client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
     assert_eq!(resp.status(), 200);
     let text = resp.text().await?;
     assert_eq!(text.len(), 10_000_000);
