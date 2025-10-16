@@ -55,8 +55,8 @@ impl Config {
         let upstream_uri: Uri = upstream_url_str
             .parse()
             .map_err(|_| anyhow!("Invalid UPSTREAM_URL: {}", upstream_url_str))?;
-        if upstream_uri.scheme_str() != Some("http") && upstream_uri.scheme_str() != Some("https") {
-            return Err(anyhow!("UPSTREAM_URL must be HTTP or HTTPS"));
+        if upstream_uri.scheme_str() != Some("http") {
+            return Err(anyhow!("UPSTREAM_URL must be HTTP"));
         }
 
         // Validate UPSTREAM_READINESS_URL
@@ -67,10 +67,8 @@ impl Config {
                 upstream_readiness_url_str
             )
         })?;
-        if upstream_readiness_uri.scheme_str() != Some("http")
-            && upstream_readiness_uri.scheme_str() != Some("https")
-        {
-            return Err(anyhow!("UPSTREAM_READINESS_URL must be HTTP or HTTPS"));
+        if upstream_readiness_uri.scheme_str() != Some("http") {
+            return Err(anyhow!("UPSTREAM_READINESS_URL must be HTTP"));
         }
 
         // Validate CERT_DIR
@@ -205,19 +203,19 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("UPSTREAM_URL must be HTTP or HTTPS"));
+            .contains("UPSTREAM_URL must be HTTP"));
     }
 
     #[test]
     fn test_from_env_invalid_scheme() {
         let mut env_map = HashMap::new();
-        env_map.insert("UPSTREAM_URL".to_string(), "ftp://example.com".to_string());
+        env_map.insert("UPSTREAM_URL".to_string(), "https://example.com".to_string());
         let result = Config::from_env_map(Some(&env_map));
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("UPSTREAM_URL must be HTTP or HTTPS"));
+            .contains("UPSTREAM_URL must be HTTP"));
     }
 
     #[test]
