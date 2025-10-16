@@ -49,7 +49,7 @@ unless noted.
 - Upstream is HTTP-only, accessible via localhost.
 - Runs as non-root user (UID 1000).
 - Supports HTTP/1.1 and HTTP/2; TLS 1.2+ with secure ciphers.
-- Certificates are PEM-encoded PKCS#8.
+- Certificates are PEM-encoded PKCS#1, PKCS#8, or SEC1 formats.
 
 ## Secret Handling
 

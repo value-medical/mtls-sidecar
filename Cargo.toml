@@ -23,6 +23,8 @@ notify = "8.2"
 axum = { version = "0.8", features = ["tokio"] }
 prometheus = "0.14"
 lazy_static = "1.4"
+rustls-pki-types = "1.12.0"
+pem = "3.0.6"
 
 [dev-dependencies]
 tempfile = "3.23"

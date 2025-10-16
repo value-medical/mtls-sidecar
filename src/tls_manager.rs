@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rustls::pki_types::PrivateKeyDer;
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
+use rustls_pki_types::{pem::PemObject, PrivateKeyDer};
 use tokio::fs;
 use tokio::sync::RwLock;
 
@@ -67,10 +67,8 @@ impl TlsManager {
         let key_pem = fs::read(&key_path)
             .await
             .context(format!("Failed to read private key from {}", key_path))?;
-        let key_der = rustls_pemfile::pkcs8_private_keys(&mut key_pem.as_slice())
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No private key found"))??;
-        let key = PrivateKeyDer::Pkcs8(key_der);
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_slice())
+            .context("Failed to parse private key from PEM")?;
 
         Ok((certs, key))
     }
