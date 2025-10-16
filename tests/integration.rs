@@ -66,6 +66,7 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
         cert_dir: cert_dir.to_str().unwrap().to_string(),
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: false,
+        monitor_port: 8081,
     };
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
     let sidecar_listener = TcpListener::bind("127.0.0.1:8443").await?;
@@ -176,6 +177,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
         cert_dir: cert_dir.to_str().unwrap().to_string(),
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: true,
+        monitor_port: 8081,
     };
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
     let sidecar_listener = TcpListener::bind("127.0.0.1:8444").await?;
@@ -285,7 +287,8 @@ fn generate_client_cert(
 
 #[tokio::test]
 async fn test_file_watching_reload() -> Result<()> {
-    let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     // Generate initial CA, server cert, and client cert
     let (ca_cert, ca_key) = generate_ca();
@@ -328,6 +331,7 @@ async fn test_file_watching_reload() -> Result<()> {
         cert_dir: cert_dir.to_str().unwrap().to_string(),
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: false,
+        monitor_port: 8081,
     };
     let tls_manager = Arc::new(mtls_sidecar::tls_manager::TlsManager::new(&config).await?);
     let sidecar_listener = TcpListener::bind("127.0.0.1:8445").await?;
@@ -339,7 +343,9 @@ async fn test_file_watching_reload() -> Result<()> {
 
     // Spawn watcher
     tokio::spawn(async move {
-        mtls_sidecar::watcher::start_watcher(&cert_dir_clone, &ca_dir_clone, watcher_tls_manager).await.unwrap();
+        mtls_sidecar::watcher::start_watcher(&cert_dir_clone, &ca_dir_clone, watcher_tls_manager)
+            .await
+            .unwrap();
     });
 
     // Spawn server
@@ -394,7 +400,10 @@ async fn test_file_watching_reload() -> Result<()> {
     std::fs::write(ca_dir.join("ca-bundle.pem"), new_ca_cert.pem())?;
 
     // Manually trigger reload to ensure it works (file watching may not trigger in test env)
-    reload_tls_manager.reload(&config.cert_dir, &config.ca_dir).await.unwrap();
+    reload_tls_manager
+        .reload(&config.cert_dir, &config.ca_dir)
+        .await
+        .unwrap();
 
     // Wait a bit
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -406,8 +415,14 @@ async fn test_file_watching_reload() -> Result<()> {
             format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
         )?)
         .build()?;
-    let result = old_client_permissive.get("https://localhost:8445/").send().await;
-    assert!(result.is_err(), "Old client cert should be rejected by new CA");
+    let result = old_client_permissive
+        .get("https://localhost:8445/")
+        .send()
+        .await;
+    assert!(
+        result.is_err(),
+        "Old client cert should be rejected by new CA"
+    );
 
     // Generate new client cert signed by new CA
     let (new_client_cert, new_client_key) = generate_client_cert(&new_ca_cert, &new_ca_key);
@@ -415,7 +430,12 @@ async fn test_file_watching_reload() -> Result<()> {
     let new_client = reqwest::Client::builder()
         .add_root_certificate(Certificate::from_pem(new_ca_cert.pem().as_bytes())?)
         .identity(reqwest::Identity::from_pem(
-            format!("{}{}", new_client_cert.pem(), new_client_key.serialize_pem()).as_bytes(),
+            format!(
+                "{}{}",
+                new_client_cert.pem(),
+                new_client_key.serialize_pem()
+            )
+            .as_bytes(),
         )?)
         .build()?;
 

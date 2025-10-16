@@ -166,7 +166,6 @@ Introduce env-based config for the core features (TLS port, upstream URL, cert/C
 - In `config.rs`, define `struct Config` with fields:
     - `tls_listen_port: u16`
     - `upstream_url: String`
-    - `upstream_readiness_url: String`
     - `cert_dir: String`
     - `ca_dir: String`
 - Implement `Config::from_env()` parsing vars with `std::env::var` fallbacks.
@@ -223,7 +222,7 @@ Add hot-reload capability for TLS files.
 Implement liveness and readiness endpoints on a dedicated port.
 
 - Extend `Cargo.toml` with `axum = { version = "0.8", features = ["tokio"] }` for the monitoring server routing.
-- In `config.rs`, add `monitor_port: u16`; parse `MONITOR_PORT` with default `8081` (env var not defined or empty).
+- In `config.rs`, add `upstream_readiness_url: String` and `monitor_port: u16`; parse `MONITOR_PORT` with default `8081` (env var not defined or empty).
 - In `monitoring.rs`, define an Axum `Router` with:
     - GET `/live` (always 200 if TLS loaded)
     - GET `/ready` (200 if TLS valid AND upstream GET to `UPSTREAM_READINESS_URL` succeeds within 1s timeout, passing

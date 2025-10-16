@@ -5,10 +5,11 @@ use std::env;
 pub struct Config {
     pub tls_listen_port: u16,
     pub upstream_url: String,
-    pub upstream_readiness_url: String,
     pub cert_dir: String,
     pub ca_dir: String,
     pub inject_client_headers: bool,
+    pub upstream_readiness_url: String,
+    pub monitor_port: u16,
 }
 
 impl Config {
@@ -26,10 +27,11 @@ impl Config {
             .unwrap_or_else(|| match key {
                 "TLS_LISTEN_PORT" => "8443".to_string(),
                 "UPSTREAM_URL" => "http://localhost:8080".to_string(),
-                "UPSTREAM_READINESS_URL" => "http://localhost:8080/ready".to_string(),
                 "CERT_DIR" => "/etc/certs".to_string(),
                 "CA_DIR" => "/etc/ca".to_string(),
                 "INJECT_CLIENT_HEADERS" => "false".to_string(),
+                "UPSTREAM_READINESS_URL" => "http://localhost:8080/ready".to_string(),
+                "MONITOR_PORT" => "8081".to_string(),
                 _ => "".to_string(),
             })
         };
@@ -40,14 +42,16 @@ impl Config {
         let cert_dir = get_var("CERT_DIR");
         let ca_dir = get_var("CA_DIR");
         let inject_client_headers = get_var("INJECT_CLIENT_HEADERS").parse().unwrap_or(false);
+        let monitor_port = get_var("MONITOR_PORT").parse().unwrap_or(8081);
 
         Config {
             tls_listen_port,
             upstream_url,
-            upstream_readiness_url,
             cert_dir,
             ca_dir,
             inject_client_headers,
+            upstream_readiness_url,
+            monitor_port,
         }
     }
 }
@@ -62,10 +66,11 @@ mod tests {
         let config = Config::from_env_map(Some(&env_map));
         assert_eq!(config.tls_listen_port, 8443);
         assert_eq!(config.upstream_url, "http://localhost:8080");
-        assert_eq!(config.upstream_readiness_url, "http://localhost:8080/ready");
         assert_eq!(config.cert_dir, "/etc/certs");
         assert_eq!(config.ca_dir, "/etc/ca");
         assert_eq!(config.inject_client_headers, false);
+        assert_eq!(config.upstream_readiness_url, "http://localhost:8080/ready");
+        assert_eq!(config.monitor_port, 8081);
     }
 
     #[test]
@@ -87,12 +92,13 @@ mod tests {
         let config = Config::from_env_map(Some(&env_map));
         assert_eq!(config.tls_listen_port, 9443);
         assert_eq!(config.upstream_url, "http://example.com:9090");
+        assert_eq!(config.cert_dir, "/custom/certs");
+        assert_eq!(config.ca_dir, "/custom/ca");
+        assert_eq!(config.inject_client_headers, true);
         assert_eq!(
             config.upstream_readiness_url,
             "http://example.com:9090/health"
         );
-        assert_eq!(config.cert_dir, "/custom/certs");
-        assert_eq!(config.ca_dir, "/custom/ca");
-        assert_eq!(config.inject_client_headers, true);
+        assert_eq!(config.monitor_port, 8081);
     }
 }
