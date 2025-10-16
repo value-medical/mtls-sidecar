@@ -103,6 +103,7 @@ where
     }
 
     // Override host header
+    // We only support http upstreams, our purpose is to terminate TLS.
     let mut host_port = format!("http://{}", upstream_uri.host().unwrap());
     if let Some(port) = upstream_uri.port_u16() {
         host_port = format!("{}:{}", host_port, port);
