@@ -83,7 +83,13 @@ async fn main() -> Result<()> {
             let current_config = tls_manager.config.read().await.clone();
             let acceptor = TlsAcceptor::from(current_config);
 
-            let stream = acceptor.accept(stream).await.unwrap();
+            let stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("TLS handshake failed: {:?}", e);
+                    return;
+                }
+            };
             tracing::info!("Client connected");
 
             let (_, server_conn) = stream.get_ref();
