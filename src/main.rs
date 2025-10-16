@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -35,7 +35,8 @@ async fn main() -> Result<()> {
     );
 
     // Create HTTP client
-    let client: Arc<Client<HttpConnector, Incoming>> = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+    let client: Arc<Client<HttpConnector, Incoming>> =
+        Arc::new(Client::builder(TokioExecutor::new()).build_http());
     tracing::info!("HTTP client created");
 
     // Create TlsManager

@@ -1,30 +1,30 @@
 use anyhow::Result;
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::{body::Body, Request, Response, StatusCode};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::TokioExecutor;
-use std::convert::Infallible;
+use hyper::{body::Body, header::HOST, http::Uri, Request, Response, StatusCode};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use std::error::Error;
 use std::sync::Arc;
 use x509_parser::prelude::*;
 
 use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
 
-type HttpClient = Client<HttpConnector, hyper::body::Incoming>;
+type BodyError = Box<dyn Error + Send + Sync>;
+
+type ProxiedBody = BoxBody<Bytes, BodyError>;
+
+type HttpClient<B> = Client<HttpConnector, B>;
 
 pub async fn handler<B>(
     req: Request<B>,
     upstream_url: &str,
     inject_client_headers: bool,
-    client: Arc<HttpClient>,
-) -> Result<
-    Response<Box<dyn Body<Data = Bytes, Error = Box<dyn Error + Send + Sync>> + Unpin + Send>>,
->
+    client: Arc<HttpClient<B>>,
+) -> Result<Response<ProxiedBody>>
 where
-    B: Body + Send + Unpin + 'static,
-    B::Data: Send,
-    B::Error: Into<Box<dyn Error + Send + Sync>>,
+    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<BodyError>,
 {
     let (parts, body) = req.into_parts();
 
@@ -34,26 +34,32 @@ where
         .get::<rustls::pki_types::CertificateDer<'static>>();
 
     if client_cert.is_none() {
+        // No cert, return 401
         MTLS_FAILURES_TOTAL.inc();
-        let body = Full::new(Bytes::from("Unauthorized"))
-            .map_err(|e: Infallible| -> Box<dyn Error + Send + Sync> { match e {} });
+        let unauthorized_full =
+            Full::new(Bytes::from("Unauthorized")).map_err(Into::<BodyError>::into);
+        let unauthorized_body: ProxiedBody = BoxBody::new(unauthorized_full);
         return Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
-            .body(Box::new(body)
-                as Box<
-                    dyn Body<Data = Bytes, Error = Box<dyn Error + Send + Sync>> + Unpin + Send,
-                >)
-            .unwrap());
+            .body(unauthorized_body)?);
     }
 
-    // Forward to upstream
-    let method = parts.method.clone();
+    // Build upstream URI
     let uri = parts.uri.clone();
+    let path_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let upstream_uri_str = format!("{}{}", upstream_url.trim_end_matches('/'), path_query);
+    let upstream_uri = match upstream_uri_str.parse::<Uri>() {
+        Err(e) => {
+            tracing::error!("Invalid upstream URI: {:?}", e);
+            return Err(anyhow::anyhow!(e.to_string()));
+        }
+        Ok(uri) => uri,
+    };
 
     // Build upstream request
     let mut upstream_req_builder = Request::builder()
-        .method(method.clone())
-        .uri(format!("{}{}", upstream_url, uri));
+        .method(parts.method.clone())
+        .uri(upstream_uri.clone());
 
     // If inject_client_headers, parse cert and add headers
     if inject_client_headers {
@@ -75,45 +81,48 @@ where
         }
     }
 
-    // Copy headers
-    for (key, value) in &parts.headers {
-        upstream_req_builder
-            .headers_mut()
-            .unwrap()
-            .insert(key, value.clone());
+    // Copy headers from original request
+    for (key, value) in parts.headers.iter() {
+        upstream_req_builder = upstream_req_builder.header(key.clone(), value.clone());
     }
 
-    // Set host header
-    let host_port = upstream_url.strip_prefix("http://").unwrap_or(upstream_url);
-    upstream_req_builder
-        .headers_mut()
-        .unwrap()
-        .insert("host", host_port.parse().unwrap());
+    // Override host header
+    let mut host_port = format!("http://{}", upstream_uri.host().unwrap());
+    if let Some(port) = upstream_uri.port_u16() {
+        host_port = format!("{}:{}", host_port, port);
+    }
+    upstream_req_builder = upstream_req_builder.header(HOST, host_port);
 
-    let upstream_req = upstream_req_builder.body(body).unwrap();
+    // Send request to upstream
+    let upstream_req = upstream_req_builder
+        .body(body)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let resp = match client.request(upstream_req).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!("Upstream request error: {:?}", e);
+            return Err(anyhow::anyhow!(e.to_string()));
+        }
+    };
 
-    let resp = client.request(upstream_req).await?;
-
-    tracing::info!("Proxied request {} {}", method, uri);
+    tracing::info!("Proxied request {} {}", parts.method.clone(), uri);
     REQUESTS_TOTAL.inc();
 
     if resp.status().is_server_error() {
         tracing::error!("Upstream error: {}", resp.status());
     }
 
-    // Forward response body without collecting
+    // Forward response
     let (parts, body) = resp.into_parts();
-    let mapped_body = body.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>);
+    let mapped_body = body.map_err(BodyError::from);
+    let proxied_body: ProxiedBody = BoxBody::new(mapped_body);
+
     let mut builder = Response::builder().status(parts.status);
-    for (k, v) in &parts.headers {
+    for (k, v) in parts.headers.iter() {
         builder = builder.header(k.clone(), v.clone());
     }
-    let response = builder
-        .body(Box::new(mapped_body)
-            as Box<
-                dyn Body<Data = Bytes, Error = Box<dyn Error + Send + Sync>> + Unpin + Send,
-            >)
-        .unwrap();
+
+    let response = builder.body(proxied_body).map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!("Response status: {}", parts.status);
 
@@ -124,13 +133,16 @@ where
 mod tests {
     use super::*;
     use http_body_util::Empty;
+    use hyper_util::rt::TokioExecutor;
     use rcgen::{CertificateParams, DnType, KeyPair};
 
     #[tokio::test]
     async fn test_handler_missing_cert() {
         let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
         let req = Request::new(Empty::<Bytes>::new());
-        let resp = handler(req, "http://localhost:8080", false, client).await.unwrap();
+        let resp = handler(req, "http://localhost:8080", false, client)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
