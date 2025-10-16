@@ -257,6 +257,175 @@ Add optional Prometheus metrics on the monitoring port.
 - Tests: Enable via config, hit `/metrics`, parse response for incremented values.
 - Integration test: Start server with metrics enabled, assert `/metrics` endpoint works and shows increments.
 
+### Step 8: Fix TLS Handshake Panic
+
+Address the critical issue where TLS handshake failures cause the service to panic.
+
+- Problem: In `main.rs`, `acceptor.accept(stream).await.unwrap()` panics on TLS handshake failure, crashing the service.
+- Fix: Replace `unwrap()` with proper error handling. Use `match` or `if let Err(e)` to log the error at `tracing::error!` and continue the accept loop.
+- Ensure the loop continues accepting new connections even after a handshake failure.
+- Add tracing: Log "TLS handshake failed" with error details (avoid logging sensitive cert data).
+- Tests:
+    - Unit test: Mock TLS acceptor failure, assert error logged and loop continues.
+    - Integration test: Attempt connection with invalid certificate, verify server remains running and accepts subsequent valid connections.
+
+### Step 9: Implement Streaming Response Handling
+
+Prevent memory exhaustion from large upstream responses.
+
+- Problem: In `proxy.rs`, `resp.into_body().collect().await?.to_bytes()` loads entire response into memory, risking OOM on large responses.
+- Fix: Implement streaming by forwarding the response body directly without collecting. Use `hyper::Response` with the upstream body's stream, avoiding full buffering.
+- Update the return type to handle streaming bodies properly.
+- Add tracing: Log response status without body content.
+- Tests:
+    - Unit test: Mock large response body, assert memory usage remains bounded.
+    - Integration test: Send request resulting in large upstream response, verify successful proxying without excessive memory use.
+
+### Step 10: Improve Error Handling and Validation
+
+Enhance robustness of configuration and error propagation.
+
+- Problem: Environment variable parsing silently defaults invalid values; missing validation for URLs/paths.
+- Fix: In `config.rs`, add validation functions that return `Result` for invalid env vars, logging warnings. Validate upstream URLs are valid HTTP URLs, ports are valid, paths exist (or log warnings).
+- Update `Config::from_env()` to return `Result<Config>`, propagating errors.
+- In `main.rs`, handle config load failures by logging and exiting gracefully.
+- Add tracing: Log validation warnings for invalid config values.
+- Tests:
+    - Unit tests for `Config::from_env()` with invalid env vars, assert errors returned.
+    - Integration test: Start with invalid config, assert clean exit with error logs.
+
+### Step 11: Optimize HTTP Client Usage
+
+Improve performance by reusing HTTP connections.
+
+- Problem: New `hyper::Client` created per request in `proxy.rs`, preventing connection reuse.
+- Fix: Create a single `hyper::Client` instance in `main.rs` or `proxy.rs`, store in `Arc` if needed, and reuse across requests.
+- Use `hyper_util::client::legacy::Client` with appropriate connector for connection pooling.
+- Add tracing: Log client creation once.
+- Tests:
+    - Unit test: Assert client reused across multiple handler calls.
+    - Integration test: Send multiple requests, verify connection reuse via logs or metrics.
+
+### Step 12: Refactor Certificate Loading Logic
+
+Eliminate code duplication in TLS manager.
+
+- Problem: Duplicate certificate loading code between `TlsManager::new()` and `reload()`.
+- Fix: Extract common logic into private helper functions like `load_certificates()`, `load_ca_bundle()`, `build_server_config()`.
+- Update both `new()` and `reload()` to call these helpers.
+- Ensure atomic updates in `reload()` using `Arc::new()` and `RwLock`.
+- Tests:
+    - Unit tests for helper functions with mock files.
+    - Integration test: Trigger reload, assert config updated without duplication issues.
+
+### Step 13: Secure Host Header Handling
+
+Prevent host header injection vulnerabilities.
+
+- Problem: Host header set manually in `proxy.rs` without validation, potentially allowing injection if upstream URL parsing fails.
+- Fix: Properly parse upstream URL to extract host and port. Validate and construct host header safely. Handle HTTPS upstreams correctly.
+- Use `hyper::Uri` parsing for robustness.
+- Add tracing: Log upstream host setting.
+- Tests:
+    - Unit test: Various upstream URLs, assert correct host header.
+    - Integration test: Proxy to HTTPS upstream, verify correct host header.
+
+### Step 14: Support Multiple Key Formats
+
+Extend compatibility for different private key formats.
+
+- Problem: Only PKCS#8 keys supported in `tls_manager.rs`.
+- Fix: Add support for PKCS#1 (RSA) and other formats by trying multiple parsers: `pkcs8_private_keys()`, `rsa_private_keys()`, etc.
+- Update key loading to attempt different formats in order.
+- Add tracing: Log key format detected.
+- Tests:
+    - Unit test: Load PKCS#1 key, assert success.
+    - Integration test: Server with PKCS#1 key, verify TLS handshake.
+
+### Step 15: Refine File Watcher Triggers
+
+Reduce unnecessary reloads by being more specific.
+
+- Problem: Watcher triggers on any `.crt/.key/.pem` file, even irrelevant ones.
+- Fix: Make watched file patterns configurable or match exactly the files used (e.g., only specific filenames like `tls.crt`).
+- Update `is_relevant_event()` to check exact filenames or make it configurable via env var.
+- Add tracing: Log which file triggered reload.
+- Tests:
+    - Unit test: Events on irrelevant files, assert no reload triggered.
+    - Integration test: Modify irrelevant file, verify no reload.
+
+### Step 16: Configurable Timeouts
+
+Allow customization of timeouts for better adaptability.
+
+- Problem: Readiness check timeout hardcoded to 1s in `monitoring.rs`.
+- Fix: Add `readiness_timeout_secs: u64` to `Config`, parse from env `READINESS_TIMEOUT_SECS` default 1.
+- Update ready_handler to use configurable timeout.
+- Add tracing: Log timeout value.
+- Tests:
+    - Unit test: Config with different timeouts, assert used.
+    - Integration test: Slow upstream, verify timeout behavior.
+
+### Step 17: Fix Test Port Conflicts
+
+Ensure tests run reliably in parallel.
+
+- Problem: Integration tests bind to fixed ports, causing conflicts.
+- Fix: Use `portpicker` crate or find free ports dynamically in tests.
+- Update `tests/integration.rs` to allocate random ports.
+- Add dependency `portpicker = "0.1"` to dev-dependencies.
+- Tests: Run tests in parallel, assert no port conflicts.
+
+### Step 18: Implement Graceful Shutdown
+
+Handle signals for clean termination.
+
+- Problem: No signal handling, abrupt shutdown can lose requests.
+- Fix: Use `tokio::signal` to listen for SIGTERM/SIGINT. On signal, stop accepting new connections, wait for in-flight requests, then exit.
+- Update `main.rs` to use `tokio::select!` for signal and accept loop.
+- Add tracing: Log shutdown initiated.
+- Tests:
+    - Integration test: Send signal, verify clean shutdown without losing requests.
+
+### Step 19: Expand Metrics
+
+Add more detailed observability.
+
+- Problem: Only basic counters; missing latency, errors by type.
+- Fix: Add histograms for request duration, counters for different error types (e.g., TLS errors, upstream errors).
+- Update `monitoring.rs` to register additional metrics.
+- Increment in relevant places.
+- Tests: Assert new metrics appear and increment correctly.
+
+### Step 20: Enhance Logging
+
+Provide better observability.
+
+- Problem: Minimal logging; missing client IPs, response details.
+- Fix: Add structured logging for client IP (from stream), response status, request timing.
+- Use `tracing` spans for requests.
+- Avoid logging sensitive data.
+- Tests: Assert logs contain expected fields.
+
+### Step 21: Add Comprehensive Tests
+
+Improve test coverage for error paths.
+
+- Problem: Missing unit tests for error scenarios.
+- Fix: Add unit tests for all error paths: invalid certs, upstream failures, config errors.
+- Aim for high coverage.
+- Tests: Run `cargo tarpaulin` or similar, verify coverage >90%.
+
+### Step 22: Dependency Maintenance
+
+Keep dependencies secure and up-to-date.
+
+- Problem: Potential security vulnerabilities in outdated deps.
+- Fix: Regularly run `cargo audit`, update dependencies in `Cargo.toml`.
+- Use `cargo update` and test thoroughly.
+- Add CI step for audit.
+- Tests: Ensure builds pass after updates.
+
 ## Building and Running
 
 Build: `cargo build --release`.
