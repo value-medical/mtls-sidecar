@@ -118,7 +118,10 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
         )?)
         .build()?;
 
-    let resp = client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
+    let resp = client
+        .get(format!("https://localhost:{}/", sidecar_port))
+        .send()
+        .await?;
     assert_eq!(resp.status(), 200);
     let text = resp.text().await?;
     assert_eq!(text, "Hello from upstream");
@@ -237,7 +240,10 @@ async fn test_proxy_with_header_injection() -> Result<()> {
         )?)
         .build()?;
 
-    let resp = client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
+    let resp = client
+        .get(format!("https://localhost:{}/", sidecar_port))
+        .send()
+        .await?;
     assert_eq!(resp.status(), 200);
 
     // Check if headers were received
@@ -407,7 +413,10 @@ async fn test_file_watching_reload() -> Result<()> {
             format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
         )?)
         .build()?;
-    let resp = old_client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
+    let resp = old_client
+        .get(format!("https://localhost:{}/", sidecar_port))
+        .send()
+        .await?;
     assert_eq!(resp.status(), 200);
 
     // Generate new certs
@@ -459,7 +468,10 @@ async fn test_file_watching_reload() -> Result<()> {
         )?)
         .build()?;
 
-    let resp = new_client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
+    let resp = new_client
+        .get(format!("https://localhost:{}/", sidecar_port))
+        .send()
+        .await?;
     assert_eq!(resp.status(), 200);
 
     Ok(())
@@ -562,7 +574,10 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     let invalid_client = reqwest::Client::builder()
         .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
         .build()?;
-    let result = invalid_client.get(format!("https://localhost:{}/", sidecar_port)).send().await;
+    let result = invalid_client
+        .get(format!("https://localhost:{}/", sidecar_port))
+        .send()
+        .await;
     assert!(
         result.is_err(),
         "Connection without client cert should fail"
@@ -575,7 +590,10 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
             format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
         )?)
         .build()?;
-    let resp = valid_client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
+    let resp = valid_client
+        .get(format!("https://localhost:{}/", sidecar_port))
+        .send()
+        .await?;
     assert_eq!(resp.status(), 200);
 
     Ok(())
@@ -683,7 +701,10 @@ async fn test_proxy_large_response() -> Result<()> {
         )?)
         .build()?;
 
-    let resp = client.get(format!("https://localhost:{}/", sidecar_port)).send().await?;
+    let resp = client
+        .get(format!("https://localhost:{}/", sidecar_port))
+        .send()
+        .await?;
     assert_eq!(resp.status(), 200);
     let text = resp.text().await?;
     assert_eq!(text.len(), 10_000_000);
