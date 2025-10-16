@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 mod config;
+mod monitoring;
 mod proxy;
 mod tls_manager;
 mod watcher;
@@ -48,6 +49,21 @@ async fn main() -> Result<()> {
             tracing::error!("Watcher error: {:?}", e);
         }
     });
+
+    // Start monitoring server
+    if config.monitor_port != 0 {
+        let router = monitoring::create_router(&config);
+        let addr = format!("0.0.0.0:{}", config.monitor_port);
+        let listener = TcpListener::bind(&addr)
+            .await
+            .context(format!("Failed to bind monitor to {}", addr))?;
+        tracing::info!("Monitoring server listening on {}", addr);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!("Monitoring server error: {:?}", e);
+            }
+        });
+    }
 
     // Bind to configured port
     let addr = format!("0.0.0.0:{}", config.tls_listen_port);
