@@ -6,6 +6,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use x509_parser::prelude::*;
 
+use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
+
 pub async fn handler<B>(
     req: Request<B>,
     upstream_url: &str,
@@ -24,6 +26,7 @@ where
         .get::<rustls::pki_types::CertificateDer<'static>>();
 
     if client_cert.is_none() {
+        MTLS_FAILURES_TOTAL.inc();
         return Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .body(Full::new(Bytes::from("Unauthorized")))
@@ -81,6 +84,7 @@ where
     let resp = client.request(upstream_req).await?;
 
     tracing::info!("Proxied request {} {}", method, uri);
+    REQUESTS_TOTAL.inc();
 
     if resp.status().is_server_error() {
         tracing::error!("Upstream error: {}", resp.status());

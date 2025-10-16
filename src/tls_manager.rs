@@ -280,6 +280,7 @@ mod tests {
             ca_dir: ca_dir.to_str().unwrap().to_string(),
             inject_client_headers: false,
             monitor_port: 8081,
+            enable_metrics: false,
         };
         let result = TlsManager::new(&config).await;
         assert!(result.is_ok());
@@ -307,6 +308,7 @@ mod tests {
             ca_dir: ca_dir.to_str().unwrap().to_string(),
             inject_client_headers: false,
             monitor_port: 8081,
+            enable_metrics: false,
         };
         let result = TlsManager::new(&config).await;
         assert!(result.is_err());
@@ -387,6 +389,7 @@ mod tests {
             ca_dir: ca_dir.to_str().unwrap().to_string(),
             inject_client_headers: false,
             monitor_port: 8081,
+            enable_metrics: false,
         };
         let tls_manager = TlsManager::new(&config).await.unwrap();
 

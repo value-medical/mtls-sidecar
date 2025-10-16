@@ -10,6 +10,7 @@ pub struct Config {
     pub inject_client_headers: bool,
     pub upstream_readiness_url: String,
     pub monitor_port: u16,
+    pub enable_metrics: bool,
 }
 
 impl Config {
@@ -32,6 +33,7 @@ impl Config {
                 "INJECT_CLIENT_HEADERS" => "false".to_string(),
                 "UPSTREAM_READINESS_URL" => "http://localhost:8080/ready".to_string(),
                 "MONITOR_PORT" => "8081".to_string(),
+                "ENABLE_METRICS" => "false".to_string(),
                 _ => "".to_string(),
             })
         };
@@ -43,6 +45,7 @@ impl Config {
         let ca_dir = get_var("CA_DIR");
         let inject_client_headers = get_var("INJECT_CLIENT_HEADERS").parse().unwrap_or(false);
         let monitor_port = get_var("MONITOR_PORT").parse().unwrap_or(8081);
+        let enable_metrics = get_var("ENABLE_METRICS").parse().unwrap_or(false);
 
         Config {
             tls_listen_port,
@@ -52,6 +55,7 @@ impl Config {
             inject_client_headers,
             upstream_readiness_url,
             monitor_port,
+            enable_metrics,
         }
     }
 }
@@ -71,6 +75,7 @@ mod tests {
         assert_eq!(config.inject_client_headers, false);
         assert_eq!(config.upstream_readiness_url, "http://localhost:8080/ready");
         assert_eq!(config.monitor_port, 8081);
+        assert_eq!(config.enable_metrics, false);
     }
 
     #[test]
@@ -100,5 +105,6 @@ mod tests {
             "http://example.com:9090/health"
         );
         assert_eq!(config.monitor_port, 8081);
+        assert_eq!(config.enable_metrics, false);
     }
 }
