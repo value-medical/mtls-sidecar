@@ -2,7 +2,8 @@ use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::{body::Body, header::HOST, http::Uri, Request, Response, StatusCode};
+use hyper::header::HOST;
+use hyper::{body::Body, http::Uri, Request, Response, StatusCode};
 use x509_parser::prelude::*;
 
 use crate::http_client_like::{BodyError, HttpClientLike, ProxiedBody};
@@ -20,6 +21,16 @@ where
     C: HttpClientLike<B>,
 {
     let (parts, body) = req.into_parts();
+
+    // Reject the request if the Upgrade header is present -- currently unsupported.
+    if parts.headers.contains_key("upgrade") {
+        let bad_request_full =
+            Full::new(Bytes::from("Bad Request")).map_err(Into::<BodyError>::into);
+        let bad_request_body: ProxiedBody = BoxBody::new(bad_request_full);
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(bad_request_body)?);
+    }
 
     // Extract client cert from extensions
     let client_cert = parts
@@ -56,8 +67,16 @@ where
 
     // Copy headers from original request
     for (key, value) in parts.headers.iter() {
-        // Filter out X-Client- headers to avoid injection
+        // Filter out Host header to avoid conflicts
+        if key == HOST {
+            continue;
+        }
+        // Filter out `X-Client-*` headers to avoid injection
         if key.as_str().starts_with("x-client-") {
+            continue;
+        }
+        // Filter out `Proxy-*` headers to avoid confusion (we don't use these)
+        if key.as_str().starts_with("proxy-") {
             continue;
         }
         upstream_req_builder = upstream_req_builder.header(key, value);
