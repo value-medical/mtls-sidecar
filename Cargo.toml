@@ -12,8 +12,7 @@ rustls = "0.23"
 rustls-pemfile = "2.1"
 tokio-rustls = "0.26"
 hyper = { version = "1.7", features = ["full"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-hyper-rustls = "0.27"
+hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy"] }
 http-body-util = "0.1"
 bytes = "1.0"
 tracing = "0.1"
@@ -24,15 +23,12 @@ notify = "8.2"
 axum = { version = "0.8", features = ["tokio"] }
 prometheus = "0.14"
 lazy_static = "1.4"
-async-trait = "0.1"
 
 [dev-dependencies]
-tokio-test = "0.4"
 tempfile = "3.23"
-rcgen = "0.13"
+rcgen = "0.14"
 time = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-async-trait = "0.1"
 portpicker = "0.1"
 
 [profile.release]
