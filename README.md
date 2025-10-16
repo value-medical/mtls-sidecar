@@ -25,6 +25,7 @@ outbound connections.
 - No multi-port or advanced routing support.
 - No outbound mTLS or service discovery.
 - No rate limiting, caching, or additional authentication.
+- Minimal logging and metrics for simplicity (upstream is expected to provide these).
 
 ## Configuration
 
@@ -68,328 +69,6 @@ On load/reload failure, logs an error and retains the previous configuration.
 - Structured JSON logging for requests, reloads, and errors.
 - License: MIT.
 
-## Overall Guidelines
-
-### Project Dependencies
-
-Use Rust 1.90+ and Cargo. The `Cargo.toml` should define a binary crate with these dependencies:
-
-- `tokio = { version = "1.48", features = ["full"] }` for async runtime.
-- `rustls = "0.23"` and `rustls-pemfile = "2.1"` for TLS and PEM parsing.
-- `tokio-rustls = "0.26"` for TLS stream handling.
-- `hyper = { version = "1.7", features = ["full"] }`, `hyper-rustls = "0.27"`, and `hyper-util = { version = "0.1", features = ["tokio"] }` for HTTP and TLS integration.
-- `http-body-util = "0.1"` for HTTP body utilities.
-- `tracing = "0.1"` and `tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }` for structured
-  logging.
-- `anyhow = "1.0"` for error chaining.
-
-For dev: `tokio-test = "0.4"`, `tempfile = "3.23"`, `rcgen = "0.13"` for test certificate generation, `time = "0.3"` for certificate validity periods, `bytes = "1.0"` for byte buffers, and `reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }` for integration tests.
-Excluding default features for reqwest is necessary to avoid native-tls dependencies, which conflict with rustls.
-
-Set `[profile.release] lto = true` and `codegen-units = 1` for optimization.
-
-### Coding Style and Imports
-
-- Follow Rust idioms: Use `Arc<Mutex<T>>` or channels for shared state; prefer `?` for error propagation.
-- Imports:
-    - Group stdlib first (`use std::{...};`), then external crates, then local modules.
-    - Qualify where ambiguous (e.g., `tokio::fs`).
-- Style:
-    - Run `cargo fmt` and `cargo clippy --fix` after each step.
-    - No `unsafe`.
-    - Aim for 100% test coverage on core logic.
-- Modules: Organize into `src/{config, tls_manager, proxy, monitoring, watcher}.rs`; import as `mod config;`.
-
-### Error Handling
-
-- Use `anyhow::Result<T>` everywhere; chain with `.context("Descriptive message")`.
-- On non-fatal errors (e.g., reload fail), log at `tracing::warn!` or `error!` and fallback to prior state.
-- Fatal errors (e.g., initial load) panic or exit with code 1.
-
-### Source Files
-
-- `src/main.rs`: Entry point with async runtime.
-- `src/tls_manager.rs`: TLS config loading, reloading, and server setup.
-- `src/proxy.rs`: Request handling and upstream forwarding.
-- `src/config.rs`: Env parsing struct and loader.
-- `src/watcher.rs`: Filesystem event loop.
-- `src/monitoring.rs`: Axum app for probes and metrics.
-- Tests: Inline in each module with `#[cfg(test)]`.
-
-## Step-by-Step Implementation Guide
-
-Implement in order, building incrementally.
-After each step:
-
-- Add logging via `tracing`. Use `tracing::info!` for milestones, `error!` for failures.
-- Write unit tests (e.g., mock files with `tempfile`), run `cargo test`, and verify with a local binary.
-- Write integration tests in `tests/` using `#[tokio::test]` and `reqwest`.
-
-### Step 1: mTLS Termination
-
-Implement basic TLS server setup in `tls_manager.rs` and `main.rs`.
-
-- Use hard-code defaults:
-    - Listen on port `8443`
-    - Read certs from `/etc/certs/tls.crt` + `/etc/certs/tls.key`
-    - Read CA bundle from `/etc/ca/ca-bundle.pem`.
-- Define a `TlsManager` struct with an `Arc<rustls::ServerConfig>` field.
-- In `TlsManager::new(cert_dir: &str, ca_dir: &str)`, read and parse PEM files using `rustls-pemfile`; build a `rustls::ServerConfig` with safe
-  defaults, client auth requiring verification, and a custom CA pool from the bundle.
-- In `main.rs`, call `TlsManager::new("/etc/certs", "/etc/ca")`; spawn a Hyper server with `tokio_rustls::TlsAcceptor` on the hardcoded port; serve a simple echo handler that
-  returns 200 OK if client cert verified.
-- Add tracing: Log "TLS loaded" on init, "Client connected" on handshake (do not log cert details).
-- Tests:
-    - Mock dir with `tempfile`, assert config parses certs and rejects invalid PEM.
-    - Integration test: Use `tokio-test` to connect with valid/invalid certs, assert 200/401.
-
-### Step 2: Proxy to Upstream
-
-Extend the TLS handler to forward requests. Hard-code upstream as `http://localhost:8080`.
-
-- In `proxy.rs`, define a handler function taking a `hyper::Request` and `TlsManager` ref.
-- Use a custom `TlsAcceptor` in `tls_manager.rs` that captures client certificates during the TLS handshake and stores
-  them in `hyper::Request::extensions()`; extract and verify client cert from extensions; if absent or unverified,
-  return 401.
-- Use `hyper::Client` with a plain HTTP connector to forward the request (copy headers/body, set host from upstream).
-- In `tls_manager.rs`, update the service_fn to call the proxy handler.
-- Update `main.rs` to use this in the Hyper builder.
-- Add tracing: Log "Proxied request" with method/path, and any 5xx errors.
-- Tests:
-    - Use `hyper::service::service_fn` mock client; assert forward preserves headers, injects no extras yet.
-    - Integration test: Start a mock upstream server, assert requests reach it with valid certs.
-    - Assert 401 on missing/invalid certs.
-
-### Step 3: Configurability
-
-Introduce env-based config for the core features (TLS port, upstream URL, cert/CA dirs).
-
-- In `config.rs`, define `struct Config` with fields:
-    - `tls_listen_port: u16`
-    - `upstream_url: String`
-    - `cert_dir: String`
-    - `ca_dir: String`
-- Implement `Config::from_env()` parsing vars with `std::env::var` fallbacks.
-- In `main.rs`, load `Config` early; pass to `TlsManager::new()` and proxy setup; bind server to config port, parse
-  upstream for client.
-- Load CA pool from `CA_DIR`:
-    - Look for `ca-bundle.pem` or `ca.crt`; if missing, use an empty pool.
-- Auto-detect files in `CERT_DIR`:
-    - Scan for preferred names (`tls.crt` + `tls.key`), fallback names (`certificate` + `private_key`).
-    - Error if neither pair found.
-    - If present, merge `ca.crt` or `issuing_ca` from `CERT_DIR` into CA pool.
-- Fail if the CA pool is empty after loading.
-- Update `TlsManager::new()` to accept `&Config` and use its fields.
-- Update `main.rs` to handle errors gracefully: log and exit if config or TLS load fails.
-- Update tracing: Include config values in init log.
-- Tests:
-    - Unit tests for `Config::from_env()` with various env setups.
-    - Mock dirs for cert/CA loading, assert correct files chosen and errors on missing.
-    - Integration test: Start server with different configs, assert correct port and upstream behavior.
-
-### Step 4: Client Header Injection
-
-- In `config.rs`, add `inject_client_headers: bool` field.
-- Parse `INJECT_CLIENT_HEADERS` as bool in `Config::from_env()`.
-- Pass this flag to the proxy handler.
-- In proxy handler, if `inject_client_headers`, extract cert subject/CN and insert headers (`X-Client-CN`,
-  `X-Client-Subject`).
-- Add tracing: Log when headers are injected (do not log cert details).
-- Tests:
-    - Mock requests with verified certs, assert headers present/absent based on config
-    - Set env vars in `#[tokio::test]`, assert parsed values and header injection.
-    - Integration test: Start server with injection enabled, assert upstream receives headers.
-
-### Step 5: File Watching
-
-Add hot-reload capability for TLS files.
-
-- Extend `Cargo.toml` with `notify = "8.2"` for filesystem watching.
-- In `watcher.rs`, define an async `start_watcher` function taking paths and `Arc<TlsManager>`.
-- Use `notify::Watcher` to monitor `cert_dir` and `ca_dir` non-recursively.
-- In a loop, receive events; on write/create for relevant files (e.g., ends with `.crt`, `.key`, `.pem`), call
-  `TlsManager::reload()` (re-run load logic, update `self.config` Arc).
-- In `tls_manager.rs`, add `async fn reload(&self, ...)` mirroring `new()` but swapping the Arc atomically.
-- In `main.rs`, spawn the watcher task after server start.
-- Add tracing: Log "File changed, reloading" per event, "Reload success/fail".
-- Tests:
-    - Use `tempfile` dir, simulate writes with `fs::write`, assert config updates without panic.
-    - Mock watcher events, assert reload called appropriately.
-    - Integration test: Start server, modify cert files, assert new connections use updated certs.
-    - Ensure existing connections remain unaffected during reload.
-
-### Step 6: Health Probes
-
-Implement liveness and readiness endpoints on a dedicated port.
-
-- Extend `Cargo.toml` with `axum = { version = "0.8", features = ["tokio"] }` for the monitoring server routing.
-- In `config.rs`, add `upstream_readiness_url: String` and `monitor_port: u16`; parse `MONITOR_PORT` with default `8081` (env var not defined or empty).
-- In `monitoring.rs`, define an Axum `Router` with:
-    - GET `/live` (always 200 if TLS loaded)
-    - GET `/ready` (200 if TLS valid AND upstream GET to `UPSTREAM_READINESS_URL` succeeds within 1s timeout, passing
-      all request headers).
-- Use `hyper::Client` for the ping in `/ready`.
-- In `main.rs`, after config load, spawn an async task to bind `TcpListener` on `monitor_port` and serve the Axum app;
-  skip if `monitor_port` is 0.
-- Ensure graceful shutdown: On main exit, signal the monitor server to stop.
-- Add tracing: Log probe calls with outcome.
-- Tests:
-    - Spawn test server, use `reqwest` to hit endpoints, assert statuses (mock upstream for readiness).
-    - Integration test: Start full server, hit probes, assert correct behavior under various states (e.g., invalid TLS).
-    - Ensure probe server shuts down gracefully on main exit.
-
-### Step 7: Metrics
-
-Add optional Prometheus metrics on the monitoring port.
-
-- Extend `Cargo.toml` with `prometheus = "0.14"` for metrics.
-- In `config.rs`, add `enable_metrics: bool`; parse `ENABLE_METRICS` as bool (default false).
-- In `main.rs`, pass this flag to the monitoring server setup.
-- In `monitoring.rs`, if `config.enable_metrics`, register counters via `prometheus::register`:
-    - `tls_reloads_total`
-    - `mtls_failures_total`
-    - `requests_total`
-- Add route `/metrics` encoding to text.
-- Increment counters in relevant spots:
-    - Reload success (+1 to reloads)
-    - Client auth fail (+1 to failures)
-    - Request proxy (+1 to total)
-- Add tracing: Log metric enables in init.
-- Tests: Enable via config, hit `/metrics`, parse response for incremented values.
-- Integration test: Start server with metrics enabled, assert `/metrics` endpoint works and shows increments.
-
-### Step 8: Fix TLS Handshake Panic
-
-Address the critical issue where TLS handshake failures cause the service to panic.
-
-- Problem: In `main.rs`, `acceptor.accept(stream).await.unwrap()` panics on TLS handshake failure, crashing the service.
-- Fix: Replace `unwrap()` with proper error handling. Use `match` or `if let Err(e)` to log the error at `tracing::error!` and continue the accept loop.
-- Ensure the loop continues accepting new connections even after a handshake failure.
-- Add tracing: Log "TLS handshake failed" with error details (avoid logging sensitive cert data).
-- Tests:
-    - Unit test: Mock TLS acceptor failure, assert error logged and loop continues.
-    - Integration test: Attempt connection with invalid certificate, verify server remains running and accepts subsequent valid connections.
-
-### Step 9: Implement Streaming Response Handling
-
-Prevent memory exhaustion from large upstream responses.
-
-- Problem: In `proxy.rs`, `resp.into_body().collect().await?.to_bytes()` loads entire response into memory, risking OOM on large responses.
-- Fix: Implement streaming by forwarding the response body directly without collecting. Use `hyper::Response` with the upstream body's stream, avoiding full buffering.
-- Update the return type to handle streaming bodies properly.
-- Add tracing: Log response status without body content.
-- Tests:
-    - Unit test: Mock large response body, assert memory usage remains bounded.
-    - Integration test: Send request resulting in large upstream response, verify successful proxying without excessive memory use.
-
-### Step 10: Improve Error Handling and Validation
-
-Enhance robustness of configuration and error propagation.
-
-- Problem: Environment variable parsing silently defaults invalid values; missing validation for URLs/paths.
-- Fix: In `config.rs`, add validation functions that return `Result` for invalid env vars, logging warnings. Validate upstream URLs are valid HTTP URLs, ports are valid, paths exist (or log warnings).
-- Update `Config::from_env()` to return `Result<Config>`, propagating errors.
-- In `main.rs`, handle config load failures by logging and exiting gracefully.
-- Add tracing: Log validation warnings for invalid config values.
-- Tests:
-    - Unit tests for `Config::from_env()` with invalid env vars, assert errors returned.
-    - Integration test: Start with invalid config, assert clean exit with error logs.
-
-### Step 11: Optimize HTTP Client Usage
-
-Improve performance by reusing HTTP connections.
-
-- Problem: New `hyper::Client` created per request in `proxy.rs`, preventing connection reuse.
-- Fix: Create a single `hyper::Client` instance in `main.rs` or `proxy.rs`, store in `Arc` if needed, and reuse across requests.
-- Use `hyper_util::client::legacy::Client` with appropriate connector for connection pooling.
-- Add tracing: Log client creation once.
-- Tests:
-    - Unit test: Assert client reused across multiple handler calls.
-    - Integration test: Send multiple requests, verify connection reuse via logs or metrics.
-
-### Step 12: Refactor Certificate Loading Logic
-
-Eliminate code duplication in TLS manager.
-
-- Problem: Duplicate certificate loading code between `TlsManager::new()` and `reload()`.
-- Fix: Extract common logic into private helper functions like `load_certificates()`, `load_ca_bundle()`, `build_server_config()`.
-- Update both `new()` and `reload()` to call these helpers.
-- Ensure atomic updates in `reload()` using `Arc::new()` and `RwLock`.
-- Tests:
-    - Unit tests for helper functions with mock files.
-    - Integration test: Trigger reload, assert config updated without duplication issues.
-
-### Step 13: Secure Host Header Handling
-
-Prevent host header injection vulnerabilities.
-
-- Problem: Host header set manually in `proxy.rs` without validation, potentially allowing injection if upstream URL parsing fails.
-- Fix: Properly parse upstream URL to extract host and port. Validate and construct host header safely. Handle HTTPS upstreams correctly.
-- Use `hyper::Uri` parsing for robustness.
-- Add tracing: Log upstream host setting.
-- Tests:
-    - Unit test: Various upstream URLs, assert correct host header.
-    - Integration test: Proxy to HTTPS upstream, verify correct host header.
-
-### Step 17: Fix Test Port Conflicts
-
-Ensure tests run reliably in parallel.
-
-- Problem: Integration tests bind to fixed ports, causing conflicts.
-- Fix: Use `portpicker` crate or find free ports dynamically in tests.
-- Update `tests/integration.rs` to allocate random ports.
-- Add dependency `portpicker = "0.1"` to dev-dependencies.
-- Tests: Run tests in parallel, assert no port conflicts.
-
-### Step 18: Implement Graceful Shutdown
-
-Handle signals for clean termination.
-
-- Problem: No signal handling, abrupt shutdown can lose requests.
-- Fix: Use `tokio::signal` to listen for SIGTERM/SIGINT. On signal, stop accepting new connections, wait for in-flight requests, then exit.
-- Update `main.rs` to use `tokio::select!` for signal and accept loop.
-- Add tracing: Log shutdown initiated.
-- Tests:
-    - Integration test: Send signal, verify clean shutdown without losing requests.
-
-### Step 19: Expand Metrics
-
-Add more detailed observability.
-
-- Problem: Only basic counters; missing latency, errors by type.
-- Fix: Add histograms for request duration, counters for different error types (e.g., TLS errors, upstream errors).
-- Update `monitoring.rs` to register additional metrics.
-- Increment in relevant places.
-- Tests: Assert new metrics appear and increment correctly.
-
-### Step 20: Enhance Logging
-
-Provide better observability.
-
-- Problem: Minimal logging; missing client IPs, response details.
-- Fix: Add structured logging for client IP (from stream), response status, request timing.
-- Use `tracing` spans for requests.
-- Avoid logging sensitive data.
-- Tests: Assert logs contain expected fields.
-
-### Step 21: Add Comprehensive Tests
-
-Improve test coverage for error paths.
-
-- Problem: Missing unit tests for error scenarios.
-- Fix: Add unit tests for all error paths: invalid certs, upstream failures, config errors.
-- Aim for high coverage.
-- Tests: Run `cargo tarpaulin` or similar, verify coverage >90%.
-
-### Step 22: Dependency Maintenance
-
-Keep dependencies secure and up-to-date.
-
-- Problem: Potential security vulnerabilities in outdated deps.
-- Fix: Regularly run `cargo audit`, update dependencies in `Cargo.toml`.
-- Use `cargo update` and test thoroughly.
-- Add CI step for audit.
-- Tests: Ensure builds pass after updates.
 
 ## Building and Running
 
@@ -482,6 +161,62 @@ Test with:
 ```
 curl --cert client.crt --key client.key https://<pod-ip>:8443/
 ```
+
+## Contributing
+
+### Development Setup
+
+- **Rust Version**: Rust 1.90+ and Cargo are required.
+- **Dependencies**: The project uses the following key dependencies (see `Cargo.toml` for full list):
+  - `tokio` for async runtime.
+  - `rustls` and related crates for TLS handling.
+  - `hyper` and `hyper-util` for HTTP server and client.
+  - `tracing` for structured logging.
+  - `anyhow` for error handling.
+  - `axum` for the monitoring server.
+  - `notify` for file watching.
+- **Development Dependencies**: For testing and development:
+  - `tempfile`, `rcgen`, `time` for test certificate generation.
+  - `reqwest` for integration tests (with rustls features).
+  - `portpicker` for dynamic port allocation in tests.
+- **Build Optimization**: Use `lto = true` and `codegen-units = 1` in `[profile.release]` for optimized builds.
+
+### Code Style and Guidelines
+
+- **Rust Idioms**: Follow standard Rust practices. Use `Arc<RwLock<T>>` or channels for shared state; prefer `?` for error propagation.
+- **Imports**:
+  - Group stdlib imports first (`use std::{...};`), then external crates, then local modules.
+  - Qualify ambiguous imports (e.g., `tokio::fs`).
+- **Style**:
+  - Run `cargo fmt` and `cargo clippy --fix` on all code.
+  - No `unsafe` code allowed.
+  - Aim for high test coverage on core logic.
+- **Modules**: Organize code into `src/{config, tls_manager, proxy, monitoring, watcher, http_client_like}.rs`; import with `mod name;`.
+
+### Error Handling
+
+- Use `anyhow::Result<T>` throughout the codebase; chain errors with `.context("Descriptive message")`.
+- For non-fatal errors (e.g., reload failures), log at `tracing::warn!` or `error!` and continue with previous state.
+- Fatal errors (e.g., initial config load) should exit gracefully with code 1.
+
+### Project Structure
+
+- `src/main.rs`: Application entry point with async runtime and signal handling.
+- `src/config.rs`: Environment variable parsing and configuration struct.
+- `src/tls_manager.rs`: TLS configuration loading, reloading, and server setup.
+- `src/proxy.rs`: HTTP request handling and upstream forwarding.
+- `src/watcher.rs`: Filesystem event monitoring for certificate updates.
+- `src/monitoring.rs`: Axum-based server for health probes and metrics.
+- `src/http_client_like.rs`: Trait for HTTP client abstraction.
+- `tests/integration.rs`: Integration tests using reqwest and dynamic ports.
+- Tests: Inline unit tests in each module with `#[cfg(test)]`.
+
+### Testing
+
+- **Unit Tests**: Write comprehensive unit tests for core functions, mocking external dependencies where needed.
+- **Integration Tests**: Use `#[tokio::test]` in `tests/` with `reqwest` for end-to-end testing. Ensure tests use dynamic ports to avoid conflicts.
+- **Running Tests**: Execute `cargo test` to run all tests. Ensure 100% coverage on critical paths.
+- **CI**: Tests should pass on all supported Rust versions.
 
 ## License
 
