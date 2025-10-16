@@ -14,6 +14,7 @@ pub async fn handler<B, C>(
     upstream_url: &str,
     inject_client_headers: bool,
     client: C,
+    client_addr: Option<std::net::SocketAddr>,
 ) -> Result<Response<ProxiedBody>>
 where
     B: Body<Data = Bytes>,
@@ -104,11 +105,17 @@ where
 
     // Override host header
     // We only support http upstreams, our purpose is to terminate TLS.
-    let mut host_port = format!("http://{}", upstream_uri.host().unwrap());
+    let mut host_port = upstream_uri.host().unwrap_or("localhost").to_string();
     if let Some(port) = upstream_uri.port_u16() {
         host_port = format!("{}:{}", host_port, port);
     }
     upstream_req_builder = upstream_req_builder.header(HOST, host_port);
+
+    // Set X-Forwarded-Proto, X-Forwarded-For headers
+    upstream_req_builder = upstream_req_builder.header("X-Forwarded-Proto", "https");
+    if let Some(addr) = client_addr {
+        upstream_req_builder = upstream_req_builder.header("X-Forwarded-For", addr.ip().to_string());
+    }
 
     // Send request to upstream
     let upstream_req = upstream_req_builder
@@ -200,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_missing_cert() {
         let req = Request::new(Empty::<Bytes>::new());
-        let resp = handler(req, "http://localhost:8080", false, MockClient)
+        let resp = handler(req, "http://localhost:8080", false, MockClient, None)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -223,7 +230,7 @@ mod tests {
         let mut req = Request::new(Empty::<Bytes>::new());
         req.extensions_mut().insert(cert_der);
 
-        let result = handler(req, "http://localhost:8080", false, MockClient).await;
+        let result = handler(req, "http://localhost:8080", false, MockClient, None).await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -252,7 +259,7 @@ mod tests {
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
         req.extensions_mut().insert(cert_der);
 
-        let result = handler(req, "http://localhost:8080", false, client).await;
+        let result = handler(req, "http://localhost:8080", false, client, None).await;
         assert!(result.is_ok());
 
         let captured_headers = captured.lock().unwrap();
@@ -288,7 +295,7 @@ mod tests {
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
         req.extensions_mut().insert(cert_der);
 
-        let result = handler(req, "http://localhost:8080", true, client).await;
+        let result = handler(req, "http://localhost:8080", true, client, None).await;
         assert!(result.is_ok());
 
         let captured_headers = captured.lock().unwrap();

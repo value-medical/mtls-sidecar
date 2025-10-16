@@ -81,6 +81,7 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
     tokio::spawn(async move {
         loop {
             let (stream, _) = sidecar_listener.accept().await.unwrap();
+            let peer_addr = stream.peer_addr().ok();
             let tls_manager = Arc::clone(&tls_manager);
             let upstream = upstream_url.clone();
             tokio::spawn(async move {
@@ -97,7 +98,8 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
                     }
                     let up = upstream.clone();
                     let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client).await }
+                    let addr = peer_addr;
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -202,6 +204,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
     tokio::spawn(async move {
         loop {
             let (stream, _) = sidecar_listener.accept().await.unwrap();
+            let peer_addr = stream.peer_addr().ok();
             let tls_manager = Arc::clone(&tls_manager);
             let upstream = upstream_url.clone();
             let inj = inject;
@@ -219,7 +222,8 @@ async fn test_proxy_with_header_injection() -> Result<()> {
                     }
                     let up = upstream.clone();
                     let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    async move { mtls_sidecar::proxy::handler(req, &up, inj, client).await }
+                    let addr = peer_addr;
+                    async move { mtls_sidecar::proxy::handler(req, &up, inj, client, addr).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -376,6 +380,7 @@ async fn test_file_watching_reload() -> Result<()> {
     tokio::spawn(async move {
         loop {
             let (stream, _) = sidecar_listener.accept().await.unwrap();
+            let peer_addr = stream.peer_addr().ok();
             let tls_manager = Arc::clone(&tls_manager);
             let upstream = upstream_url.clone();
             tokio::spawn(async move {
@@ -392,7 +397,8 @@ async fn test_file_watching_reload() -> Result<()> {
                     }
                     let up = upstream.clone();
                     let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client).await }
+                    let addr = peer_addr;
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -534,6 +540,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     tokio::spawn(async move {
         loop {
             let (stream, _) = sidecar_listener.accept().await.unwrap();
+            let peer_addr = stream.peer_addr().ok();
             let tls_manager = Arc::clone(&tls_manager);
             let upstream = upstream_url.clone();
             tokio::spawn(async move {
@@ -553,7 +560,8 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                     }
                     let up = upstream.clone();
                     let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client).await }
+                    let addr = peer_addr;
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -663,6 +671,7 @@ async fn test_proxy_large_response() -> Result<()> {
     tokio::spawn(async move {
         loop {
             let (stream, _) = sidecar_listener.accept().await.unwrap();
+            let peer_addr = stream.peer_addr().ok();
             let tls_manager = Arc::clone(&tls_manager);
             let upstream = upstream_url.clone();
             tokio::spawn(async move {
@@ -679,7 +688,8 @@ async fn test_proxy_large_response() -> Result<()> {
                     }
                     let up = upstream.clone();
                     let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client).await }
+                    let addr = peer_addr;
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)

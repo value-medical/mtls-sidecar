@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
                         let counter = Arc::clone(&active_connections);
 
                         tokio::spawn(async move {
+                            let peer_addr = stream.peer_addr().ok();
                             let current_config = tls_manager.config.read().await.clone();
                             let acceptor = TlsAcceptor::from(current_config);
 
@@ -132,7 +133,7 @@ async fn main() -> Result<()> {
                                 let up = upstream.clone();
                                 let inj = inject;
                                 let cli = Arc::clone(&client);
-                                async move { proxy::handler(req, &up, inj, cli).await }
+                                async move { proxy::handler(req, &up, inj, cli, peer_addr).await }
                             });
 
                             if let Err(err) = http1::Builder::new()
