@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -31,6 +33,10 @@ async fn main() -> Result<()> {
         config.cert_dir,
         config.ca_dir
     );
+
+    // Create HTTP client
+    let client: Arc<Client<HttpConnector, Incoming>> = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+    tracing::info!("HTTP client created");
 
     // Create TlsManager
     let tls_manager = Arc::new(
@@ -73,11 +79,13 @@ async fn main() -> Result<()> {
 
     let upstream_url = config.upstream_url.clone();
     let inject_headers = config.inject_client_headers;
+    let http_client = Arc::clone(&client);
     loop {
         let (stream, _) = listener.accept().await?;
         let tls_manager = Arc::clone(&tls_manager);
         let upstream = upstream_url.clone();
         let inject = inject_headers;
+        let client = Arc::clone(&http_client);
 
         tokio::spawn(async move {
             let current_config = tls_manager.config.read().await.clone();
@@ -103,7 +111,8 @@ async fn main() -> Result<()> {
                 }
                 let up = upstream.clone();
                 let inj = inject;
-                async move { proxy::handler(req, &up, inj).await }
+                let cli = Arc::clone(&client);
+                async move { proxy::handler(req, &up, inj, cli).await }
             });
 
             if let Err(err) = http1::Builder::new()
