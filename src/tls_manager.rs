@@ -14,10 +14,12 @@ pub struct TlsManager {
 }
 
 impl TlsManager {
-    pub async fn new(config: &Config) -> Result<Self> {
-        let cert_dir = &config.cert_dir;
-        let ca_dir = &config.ca_dir;
-
+    async fn load_cert_and_key(
+        cert_dir: &str,
+    ) -> Result<(
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+    )> {
         // Auto-detect cert and key files
         let (cert_path, key_path) = if fs::try_exists(format!("{}/tls.crt", cert_dir))
             .await
@@ -66,7 +68,13 @@ impl TlsManager {
             .ok_or_else(|| anyhow::anyhow!("No private key found"))??;
         let key = PrivateKeyDer::Pkcs8(key_der);
 
-        // Collect CA certificates
+        Ok((certs, key))
+    }
+
+    async fn load_ca_certs(
+        cert_dir: &str,
+        ca_dir: &str,
+    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
         let mut ca_certs = Vec::new();
         // From ca_dir
         if let Ok(ca_pem) = fs::read(format!("{}/ca-bundle.pem", ca_dir)).await {
@@ -97,6 +105,14 @@ impl TlsManager {
             );
         }
 
+        Ok(ca_certs)
+    }
+
+    fn build_server_config(
+        certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        ca_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    ) -> Result<ServerConfig> {
         if ca_certs.is_empty() {
             return Err(anyhow::anyhow!("No CA certificates found"));
         }
@@ -120,116 +136,25 @@ impl TlsManager {
             .with_single_cert(certs, key)
             .map_err(|e| anyhow::anyhow!("Failed to build server config: {}", e))?;
 
+        Ok(config)
+    }
+    pub async fn new(config: &Config) -> Result<Self> {
+        let (certs, key) = Self::load_cert_and_key(&config.cert_dir).await?;
+        let ca_certs = Self::load_ca_certs(&config.cert_dir, &config.ca_dir).await?;
+        let server_config = Self::build_server_config(certs, key, ca_certs)?;
+
         Ok(TlsManager {
-            config: Arc::new(RwLock::new(Arc::new(config))),
+            config: Arc::new(RwLock::new(Arc::new(server_config))),
         })
     }
 
     pub async fn reload(&self, cert_dir: &str, ca_dir: &str) -> Result<()> {
-        // Auto-detect cert and key files
-        let (cert_path, key_path) = if fs::try_exists(format!("{}/tls.crt", cert_dir))
-            .await
-            .unwrap_or(false)
-            && fs::try_exists(format!("{}/tls.key", cert_dir))
-                .await
-                .unwrap_or(false)
-        {
-            (
-                format!("{}/tls.crt", cert_dir),
-                format!("{}/tls.key", cert_dir),
-            )
-        } else if fs::try_exists(format!("{}/certificate", cert_dir))
-            .await
-            .unwrap_or(false)
-            && fs::try_exists(format!("{}/private_key", cert_dir))
-                .await
-                .unwrap_or(false)
-        {
-            (
-                format!("{}/certificate", cert_dir),
-                format!("{}/private_key", cert_dir),
-            )
-        } else {
-            return Err(anyhow::anyhow!(
-                "No valid cert/key pair found in {}",
-                cert_dir
-            ));
-        };
-
-        // Read certificate
-        let cert_pem = fs::read(&cert_path).await.context(format!(
-            "Failed to read server certificate from {}",
-            cert_path
-        ))?;
-        let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to parse server certificate")?;
-
-        // Read private key
-        let key_pem = fs::read(&key_path)
-            .await
-            .context(format!("Failed to read private key from {}", key_path))?;
-        let key_der = rustls_pemfile::pkcs8_private_keys(&mut key_pem.as_slice())
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No private key found"))??;
-        let key = PrivateKeyDer::Pkcs8(key_der);
-
-        // Collect CA certificates
-        let mut ca_certs = Vec::new();
-        // From ca_dir
-        if let Ok(ca_pem) = fs::read(format!("{}/ca-bundle.pem", ca_dir)).await {
-            ca_certs.extend(
-                rustls_pemfile::certs(&mut ca_pem.as_slice())
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("Failed to parse CA bundle from ca-bundle.pem")?,
-            );
-        } else if let Ok(ca_pem) = fs::read(format!("{}/ca.crt", ca_dir)).await {
-            ca_certs.extend(
-                rustls_pemfile::certs(&mut ca_pem.as_slice())
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("Failed to parse CA bundle from ca.crt")?,
-            );
-        }
-        // From cert_dir
-        if let Ok(ca_pem) = fs::read(format!("{}/ca.crt", cert_dir)).await {
-            ca_certs.extend(
-                rustls_pemfile::certs(&mut ca_pem.as_slice())
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("Failed to parse CA bundle from cert_dir/ca.crt")?,
-            );
-        } else if let Ok(ca_pem) = fs::read(format!("{}/issuing_ca", cert_dir)).await {
-            ca_certs.extend(
-                rustls_pemfile::certs(&mut ca_pem.as_slice())
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("Failed to parse CA bundle from issuing_ca")?,
-            );
-        }
-
-        if ca_certs.is_empty() {
-            return Err(anyhow::anyhow!("No CA certificates found"));
-        }
-
-        // Build root cert store
-        let mut roots = RootCertStore::empty();
-        for cert in ca_certs {
-            roots
-                .add(cert)
-                .map_err(|e| anyhow::anyhow!("Failed to add CA cert: {}", e))?;
-        }
-
-        // Create client verifier that requires client certs
-        let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .context("Failed to build client verifier")?;
-
-        // Build server config
-        let config = ServerConfig::builder()
-            .with_client_cert_verifier(client_verifier)
-            .with_single_cert(certs, key)
-            .map_err(|e| anyhow::anyhow!("Failed to build server config: {}", e))?;
+        let (certs, key) = Self::load_cert_and_key(cert_dir).await?;
+        let ca_certs = Self::load_ca_certs(cert_dir, ca_dir).await?;
+        let server_config = Self::build_server_config(certs, key, ca_certs)?;
 
         // Update the config atomically
-        let new_arc = Arc::new(config);
+        let new_arc = Arc::new(server_config);
         *self.config.write().await = new_arc;
 
         Ok(())

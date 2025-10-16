@@ -237,9 +237,7 @@ mod tests {
 
         let captured_headers = captured.lock().unwrap();
         // Check that x-client-test is not present
-        assert!(!captured_headers
-            .iter()
-            .any(|(k, _)| k == "x-client-test"));
+        assert!(!captured_headers.iter().any(|(k, _)| k == "x-client-test"));
         // Check that other-header is present
         assert!(captured_headers
             .iter()
@@ -275,9 +273,7 @@ mod tests {
 
         let captured_headers = captured.lock().unwrap();
         // Check that x-client-test is not present
-        assert!(!captured_headers
-            .iter()
-            .any(|(k, _)| k == "x-client-test"));
+        assert!(!captured_headers.iter().any(|(k, _)| k == "x-client-test"));
         // Check that injected headers are present
         assert!(captured_headers
             .iter()

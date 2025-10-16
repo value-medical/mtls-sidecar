@@ -19,12 +19,8 @@ pub trait HttpClientLike<B>: Send + Sync {
         req: Request<B>,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<
-                        Response<ProxiedBody>,
-                        hyper_util::client::legacy::Error,
-                    >,
-                > + Send,
+            dyn Future<Output = Result<Response<ProxiedBody>, hyper_util::client::legacy::Error>>
+                + Send,
         >,
     >;
 }
@@ -39,12 +35,8 @@ where
         req: Request<B>,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<
-                        Response<ProxiedBody>,
-                        hyper_util::client::legacy::Error,
-                    >,
-                > + Send,
+            dyn Future<Output = Result<Response<ProxiedBody>, hyper_util::client::legacy::Error>>
+                + Send,
         >,
     > {
         let client = self.clone();
@@ -68,12 +60,8 @@ where
         req: Request<B>,
     ) -> Pin<
         Box<
-            dyn Future<
-                    Output = Result<
-                        Response<ProxiedBody>,
-                        hyper_util::client::legacy::Error,
-                    >,
-                > + Send,
+            dyn Future<Output = Result<Response<ProxiedBody>, hyper_util::client::legacy::Error>>
+                + Send,
         >,
     > {
         let client = self.clone();
