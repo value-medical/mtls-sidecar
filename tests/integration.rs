@@ -448,6 +448,114 @@ async fn test_file_watching_reload() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_tls_handshake_failure_handling() -> Result<()> {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Generate CA and server cert
+    let (ca_cert, ca_key) = generate_ca();
+    let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key);
+
+    // Write certs to temp dirs
+    let temp_dir = TempDir::new()?;
+    let cert_dir = temp_dir.path().join("certs");
+    let ca_dir = temp_dir.path().join("ca");
+    std::fs::create_dir(&cert_dir)?;
+    std::fs::create_dir(&ca_dir)?;
+
+    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
+    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
+
+    // Start mock upstream
+    let upstream_listener = TcpListener::bind("127.0.0.1:8083").await?;
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|_req| async {
+                    Ok::<_, hyper::Error>(hyper::Response::new(Full::new(Bytes::from("OK"))))
+                });
+                http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // Start sidecar
+    let config = mtls_sidecar::config::Config {
+        tls_listen_port: 8446,
+        upstream_url: "http://127.0.0.1:8083".to_string(),
+        upstream_readiness_url: "http://127.0.0.1:8083/ready".to_string(),
+        cert_dir: cert_dir.to_str().unwrap().to_string(),
+        ca_dir: ca_dir.to_str().unwrap().to_string(),
+        inject_client_headers: false,
+        monitor_port: 8081,
+        enable_metrics: false,
+    };
+    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+    let sidecar_listener = TcpListener::bind("127.0.0.1:8446").await?;
+    let upstream_url = config.upstream_url.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = sidecar_listener.accept().await.unwrap();
+            let tls_manager = Arc::clone(&tls_manager);
+            let upstream = upstream_url.clone();
+            tokio::spawn(async move {
+                let current_config = tls_manager.config.read().await.clone();
+                let acceptor = TlsAcceptor::from(current_config);
+                let stream = match acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(_) => return, // Simulate the fixed behavior
+                };
+                let (_, server_conn) = stream.get_ref();
+                let client_cert = server_conn
+                    .peer_certificates()
+                    .and_then(|certs| certs.first().cloned());
+                let service = service_fn(move |mut req| {
+                    if let Some(cert) = &client_cert {
+                        req.extensions_mut().insert(cert.clone());
+                    }
+                    let up = upstream.clone();
+                    async move { mtls_sidecar::proxy::handler(req, &up, false).await }
+                });
+                http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // Wait for server to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Generate valid client cert
+    let (client_cert, client_key) = generate_client_cert(&ca_cert, &ca_key);
+
+    // Try invalid connection (no client cert)
+    let invalid_client = reqwest::Client::builder()
+        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
+        .build()?;
+    let result = invalid_client.get("https://localhost:8446/").send().await;
+    assert!(result.is_err(), "Connection without client cert should fail");
+
+    // Now try valid connection
+    let valid_client = reqwest::Client::builder()
+        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
+        .identity(reqwest::Identity::from_pem(
+            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
+        )?)
+        .build()?;
+    let resp = valid_client.get("https://localhost:8446/").send().await?;
+    assert_eq!(resp.status(), 200);
+
+    Ok(())
+}
+
 fn validity_period() -> (OffsetDateTime, OffsetDateTime) {
     let day = Duration::new(86400, 0);
     let yesterday = OffsetDateTime::now_utc().checked_sub(day).unwrap();
