@@ -7,7 +7,7 @@ use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use portpicker;
-use rcgen::CertificateParams;
+use rcgen::{CertificateParams, Issuer};
 use rcgen::DnType;
 use rcgen::KeyPair;
 use reqwest::Certificate;
@@ -30,9 +30,9 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
     let sidecar_port = portpicker::pick_unused_port().expect("No free port");
 
     // Generate CA, server cert, and client cert
-    let (ca_cert, ca_key) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key);
-    let (client_cert, client_key) = generate_client_cert(&ca_cert, &ca_key);
+    let (ca_cert, issuer) = generate_ca();
+    let (server_cert, server_key) = generate_server_cert(&issuer);
+    let (client_cert, client_key) = generate_client_cert(&issuer);
 
     // Write certs to temp dirs
     let temp_dir = TempDir::new()?;
@@ -139,9 +139,9 @@ async fn test_proxy_with_header_injection() -> Result<()> {
     let sidecar_port = portpicker::pick_unused_port().expect("No free port");
 
     // Generate CA, server cert, and client cert with CN
-    let (ca_cert, ca_key) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key);
-    let (client_cert, client_key) = generate_client_cert(&ca_cert, &ca_key);
+    let (ca_cert, issuer) = generate_ca();
+    let (server_cert, server_key) = generate_server_cert(&issuer);
+    let (client_cert, client_key) = generate_client_cert(&issuer);
 
     // Write certs to temp dirs
     let temp_dir = TempDir::new()?;
@@ -255,7 +255,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
     Ok(())
 }
 
-fn generate_ca() -> (rcgen::Certificate, KeyPair) {
+fn generate_ca() -> (rcgen::Certificate, Issuer<'static, KeyPair>) {
     let mut params = CertificateParams::new(vec![]).unwrap();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params
@@ -266,12 +266,12 @@ fn generate_ca() -> (rcgen::Certificate, KeyPair) {
     params.not_after = tomorrow;
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
-    (cert, key_pair)
+    let issuer = Issuer::new(params, key_pair);
+    (cert, issuer)
 }
 
 fn generate_server_cert(
-    ca_cert: &rcgen::Certificate,
-    ca_key: &KeyPair,
+    issuer: &Issuer<KeyPair>,
 ) -> (rcgen::Certificate, KeyPair) {
     let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params
@@ -284,13 +284,12 @@ fn generate_server_cert(
     params.not_before = yesterday;
     params.not_after = tomorrow;
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let cert = params.signed_by(&key_pair, ca_cert, ca_key).unwrap();
+    let cert = params.signed_by(&key_pair, issuer).unwrap();
     (cert, key_pair)
 }
 
 fn generate_client_cert(
-    ca_cert: &rcgen::Certificate,
-    ca_key: &KeyPair,
+    issuer: &Issuer<KeyPair>,
 ) -> (rcgen::Certificate, KeyPair) {
     let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params.distinguished_name.push(DnType::CommonName, "client");
@@ -301,7 +300,7 @@ fn generate_client_cert(
     params.not_before = yesterday;
     params.not_after = tomorrow;
     let key_pair = KeyPair::generate().unwrap();
-    let cert = params.signed_by(&key_pair, ca_cert, ca_key).unwrap();
+    let cert = params.signed_by(&key_pair, &issuer).unwrap();
     (cert, key_pair)
 }
 
@@ -315,9 +314,9 @@ async fn test_file_watching_reload() -> Result<()> {
     let sidecar_port = portpicker::pick_unused_port().expect("No free port");
 
     // Generate initial CA, server cert, and client cert
-    let (ca_cert, ca_key) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key);
-    let (client_cert, client_key) = generate_client_cert(&ca_cert, &ca_key);
+    let (ca_cert, issuer) = generate_ca();
+    let (server_cert, server_key) = generate_server_cert(&issuer);
+    let (client_cert, client_key) = generate_client_cert(&issuer);
 
     // Write initial certs to temp dirs
     let temp_dir = TempDir::new()?;
@@ -420,8 +419,8 @@ async fn test_file_watching_reload() -> Result<()> {
     assert_eq!(resp.status(), 200);
 
     // Generate new certs
-    let (new_ca_cert, new_ca_key) = generate_ca();
-    let (new_server_cert, new_server_key) = generate_server_cert(&new_ca_cert, &new_ca_key);
+    let (new_ca_cert, issuer) = generate_ca();
+    let (new_server_cert, new_server_key) = generate_server_cert(&issuer);
 
     // Overwrite cert files to trigger reload
     std::fs::write(cert_dir.join("tls.crt"), new_server_cert.pem())?;
@@ -454,7 +453,7 @@ async fn test_file_watching_reload() -> Result<()> {
     );
 
     // Generate new client cert signed by new CA
-    let (new_client_cert, new_client_key) = generate_client_cert(&new_ca_cert, &new_ca_key);
+    let (new_client_cert, new_client_key) = generate_client_cert(&issuer);
 
     let new_client = reqwest::Client::builder()
         .add_root_certificate(Certificate::from_pem(new_ca_cert.pem().as_bytes())?)
@@ -487,8 +486,8 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     let sidecar_port = portpicker::pick_unused_port().expect("No free port");
 
     // Generate CA and server cert
-    let (ca_cert, ca_key) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key);
+    let (ca_cert, issuer) = generate_ca();
+    let (server_cert, server_key) = generate_server_cert(&issuer);
 
     // Write certs to temp dirs
     let temp_dir = TempDir::new()?;
@@ -568,7 +567,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Generate valid client cert
-    let (client_cert, client_key) = generate_client_cert(&ca_cert, &ca_key);
+    let (client_cert, client_key) = generate_client_cert(&issuer);
 
     // Try invalid connection (no client cert)
     let invalid_client = reqwest::Client::builder()
@@ -609,9 +608,9 @@ async fn test_proxy_large_response() -> Result<()> {
     let sidecar_port = portpicker::pick_unused_port().expect("No free port");
 
     // Generate CA, server cert, and client cert
-    let (ca_cert, ca_key) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key);
-    let (client_cert, client_key) = generate_client_cert(&ca_cert, &ca_key);
+    let (ca_cert, issuer) = generate_ca();
+    let (server_cert, server_key) = generate_server_cert(&issuer);
+    let (client_cert, client_key) = generate_client_cert(&issuer);
 
     // Write certs to temp dirs
     let temp_dir = TempDir::new()?;
