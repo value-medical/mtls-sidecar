@@ -72,8 +72,14 @@ mod tests {
     fn test_from_env_with_vars() {
         let mut env_map = HashMap::new();
         env_map.insert("TLS_LISTEN_PORT".to_string(), "9443".to_string());
-        env_map.insert("UPSTREAM_URL".to_string(), "http://example.com:9090".to_string());
-        env_map.insert("UPSTREAM_READINESS_URL".to_string(), "http://example.com:9090/health".to_string());
+        env_map.insert(
+            "UPSTREAM_URL".to_string(),
+            "http://example.com:9090".to_string(),
+        );
+        env_map.insert(
+            "UPSTREAM_READINESS_URL".to_string(),
+            "http://example.com:9090/health".to_string(),
+        );
         env_map.insert("CERT_DIR".to_string(), "/custom/certs".to_string());
         env_map.insert("CA_DIR".to_string(), "/custom/ca".to_string());
         env_map.insert("INJECT_CLIENT_HEADERS".to_string(), "true".to_string());
