@@ -4,7 +4,8 @@ use http_body_util::Full;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::CertificateParams;
 use rcgen::DnType;
 use rcgen::KeyPair;
@@ -90,7 +91,8 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
                         req.extensions_mut().insert(cert.clone());
                     }
                     let up = upstream.clone();
-                    async move { mtls_sidecar::proxy::handler(req, &up, false).await }
+                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -204,7 +206,8 @@ async fn test_proxy_with_header_injection() -> Result<()> {
                         req.extensions_mut().insert(cert.clone());
                     }
                     let up = upstream.clone();
-                    async move { mtls_sidecar::proxy::handler(req, &up, inj).await }
+                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+                    async move { mtls_sidecar::proxy::handler(req, &up, inj, client).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -370,7 +373,8 @@ async fn test_file_watching_reload() -> Result<()> {
                         req.extensions_mut().insert(cert.clone());
                     }
                     let up = upstream.clone();
-                    async move { mtls_sidecar::proxy::handler(req, &up, false).await }
+                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -520,7 +524,8 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                         req.extensions_mut().insert(cert.clone());
                     }
                     let up = upstream.clone();
-                    async move { mtls_sidecar::proxy::handler(req, &up, false).await }
+                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -635,7 +640,8 @@ async fn test_proxy_large_response() -> Result<()> {
                         req.extensions_mut().insert(cert.clone());
                     }
                     let up = upstream.clone();
-                    async move { mtls_sidecar::proxy::handler(req, &up, false).await }
+                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client).await }
                 });
                 http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)

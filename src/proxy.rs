@@ -2,18 +2,22 @@ use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Body, Request, Response, StatusCode};
-use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use std::convert::Infallible;
 use std::error::Error;
+use std::sync::Arc;
 use x509_parser::prelude::*;
 
 use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
+
+type HttpClient = Client<HttpConnector, hyper::body::Incoming>;
 
 pub async fn handler<B>(
     req: Request<B>,
     upstream_url: &str,
     inject_client_headers: bool,
+    client: Arc<HttpClient>,
 ) -> Result<
     Response<Box<dyn Body<Data = Bytes, Error = Box<dyn Error + Send + Sync>> + Unpin + Send>>,
 >
@@ -43,8 +47,6 @@ where
     }
 
     // Forward to upstream
-    let client = Client::builder(TokioExecutor::new()).build_http();
-
     let method = parts.method.clone();
     let uri = parts.uri.clone();
 
@@ -126,8 +128,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_missing_cert() {
+        let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
         let req = Request::new(Empty::<Bytes>::new());
-        let resp = handler(req, "http://localhost:8080", false).await.unwrap();
+        let resp = handler(req, "http://localhost:8080", false, client).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -150,7 +153,8 @@ mod tests {
 
         // Since upstream is not running, it will fail, but we can check if it tries to connect
         // For this test, just ensure it doesn't return UNAUTHORIZED
-        let result = handler(req, "http://localhost:8080", false).await;
+        let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+        let result = handler(req, "http://localhost:8080", false, client).await;
         // It should try to proxy and fail with connection error, not UNAUTHORIZED
         assert!(result.is_err()); // Since no upstream
     }
