@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Load config
-    let config = config::Config::from_env();
+    let config = config::Config::from_env().context("Failed to load config")?;
     tracing::info!(
         "Config loaded: port={}, upstream={}, cert_dir={}, ca_dir={}",
         config.tls_listen_port,
