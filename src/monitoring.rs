@@ -1,19 +1,45 @@
-use axum::{body::Body as AxumBody, http::Request, routing::get, Router};
+use axum::{
+    body::Body as AxumBody,
+    http::{Request, StatusCode},
+    routing::get,
+    Router,
+};
 use bytes::Bytes;
 use http_body_util::Empty;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use lazy_static::lazy_static;
+use prometheus::{register_int_counter, Encoder, IntCounter, TextEncoder};
 use std::time::Duration;
 
 use crate::config::Config;
 
+lazy_static! {
+    pub static ref TLS_RELOADS_TOTAL: IntCounter =
+        register_int_counter!("tls_reloads_total", "Total number of TLS reloads").unwrap();
+    pub static ref MTLS_FAILURES_TOTAL: IntCounter = register_int_counter!(
+        "mtls_failures_total",
+        "Total number of mTLS authentication failures"
+    )
+    .unwrap();
+    pub static ref REQUESTS_TOTAL: IntCounter =
+        register_int_counter!("requests_total", "Total number of proxied requests").unwrap();
+}
+
 pub fn create_router(config: &Config) -> Router {
     let readiness_url = config.upstream_readiness_url.clone();
 
-    Router::new().route("/live", get(live_handler)).route(
+    let mut router = Router::new().route("/live", get(live_handler)).route(
         "/ready",
         get(move |req| ready_handler(req, readiness_url.clone())),
-    )
+    );
+
+    if config.enable_metrics {
+        tracing::info!("Metrics enabled");
+        router = router.route("/metrics", get(metrics_handler));
+    }
+
+    router
 }
 
 async fn live_handler() -> &'static str {
@@ -49,6 +75,16 @@ async fn ready_handler(
     }
 }
 
+async fn metrics_handler() -> Result<String, StatusCode> {
+    let encoder = TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let mut buffer = Vec::new();
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    String::from_utf8(buffer).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,6 +106,7 @@ mod tests {
             ca_dir: "/etc/ca".to_string(),
             inject_client_headers: false,
             monitor_port: 8081,
+            enable_metrics: false,
         });
 
         // For unit test, perhaps use axum-test or something, but since no extra deps, maybe skip or mock.
@@ -108,5 +145,16 @@ mod tests {
         let req = Request::get("/ready").body(Body::empty()).unwrap();
         let result = ready_handler(req, "http://127.0.0.1:9999/ready".to_string()).await;
         assert_eq!(result, Err(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_handler() {
+        // Increment a counter to ensure metrics are present
+        TLS_RELOADS_TOTAL.inc();
+        let result = metrics_handler().await;
+        assert!(result.is_ok());
+        let body = result.unwrap();
+        assert!(body.contains("# HELP tls_reloads_total"));
+        assert!(body.contains("tls_reloads_total 1"));
     }
 }

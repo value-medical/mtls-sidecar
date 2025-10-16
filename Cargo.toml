@@ -22,6 +22,8 @@ anyhow = "1.0"
 x509-parser = "0.16"
 notify = "8.2"
 axum = { version = "0.8", features = ["tokio"] }
+prometheus = "0.14"
+lazy_static = "1.4"
 
 [dev-dependencies]
 tokio-test = "0.4"

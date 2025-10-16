@@ -67,6 +67,7 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: false,
         monitor_port: 8081,
+        enable_metrics: false,
     };
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
     let sidecar_listener = TcpListener::bind("127.0.0.1:8443").await?;
@@ -178,6 +179,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: true,
         monitor_port: 8081,
+        enable_metrics: false,
     };
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
     let sidecar_listener = TcpListener::bind("127.0.0.1:8444").await?;
@@ -332,6 +334,7 @@ async fn test_file_watching_reload() -> Result<()> {
         ca_dir: ca_dir.to_str().unwrap().to_string(),
         inject_client_headers: false,
         monitor_port: 8081,
+        enable_metrics: false,
     };
     let tls_manager = Arc::new(mtls_sidecar::tls_manager::TlsManager::new(&config).await?);
     let sidecar_listener = TcpListener::bind("127.0.0.1:8445").await?;

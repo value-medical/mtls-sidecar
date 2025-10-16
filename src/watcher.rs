@@ -27,7 +27,10 @@ pub async fn start_watcher(
                 if is_relevant_event(&event) {
                     tracing::info!("File changed, reloading TLS config");
                     match tls_manager.reload(cert_dir, ca_dir).await {
-                        Ok(_) => tracing::info!("Reload success"),
+                        Ok(_) => {
+                            tracing::info!("Reload success");
+                            crate::monitoring::TLS_RELOADS_TOTAL.inc();
+                        }
                         Err(e) => tracing::error!("Reload fail: {:?}", e),
                     }
                 }
