@@ -18,7 +18,7 @@ bytes = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1.0"
-x509-parser = "0.16"
+x509-parser = "0.18"
 notify = "8.2"
 axum = { version = "0.8", features = ["tokio"] }
 prometheus = "0.14"
