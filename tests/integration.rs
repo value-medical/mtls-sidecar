@@ -665,6 +665,28 @@ async fn test_proxy_large_response() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_invalid_config_exits() -> Result<()> {
+    use std::process::Command;
+
+    // Run the binary with invalid TLS_LISTEN_PORT
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mtls-sidecar"));
+    cmd.env("TLS_LISTEN_PORT", "invalid_port");
+    cmd.env("CERT_DIR", "/tmp/nonexistent");
+    cmd.env("CA_DIR", "/tmp/nonexistent");
+
+    let output = cmd.output().expect("Failed to run command");
+
+    // Should exit with non-zero code
+    assert!(!output.status.success());
+
+    // Check stderr contains error
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Invalid TLS_LISTEN_PORT"));
+
+    Ok(())
+}
+
 fn validity_period() -> (OffsetDateTime, OffsetDateTime) {
     let day = Duration::new(86400, 0);
     let yesterday = OffsetDateTime::now_utc().checked_sub(day).unwrap();
