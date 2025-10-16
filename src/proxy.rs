@@ -4,6 +4,8 @@ use http_body_util::{BodyExt, Full};
 use hyper::{body::Body, Request, Response, StatusCode};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use std::convert::Infallible;
+use std::error::Error;
 use x509_parser::prelude::*;
 
 use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
@@ -12,11 +14,13 @@ pub async fn handler<B>(
     req: Request<B>,
     upstream_url: &str,
     inject_client_headers: bool,
-) -> Result<Response<Full<Bytes>>>
+) -> Result<
+    Response<Box<dyn Body<Data = Bytes, Error = Box<dyn Error + Send + Sync>> + Unpin + Send>>,
+>
 where
     B: Body + Send + Unpin + 'static,
     B::Data: Send,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B::Error: Into<Box<dyn Error + Send + Sync>>,
 {
     let (parts, body) = req.into_parts();
 
@@ -27,9 +31,14 @@ where
 
     if client_cert.is_none() {
         MTLS_FAILURES_TOTAL.inc();
+        let body = Full::new(Bytes::from("Unauthorized"))
+            .map_err(|e: Infallible| -> Box<dyn Error + Send + Sync> { match e {} });
         return Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
-            .body(Full::new(Bytes::from("Unauthorized")))
+            .body(Box::new(body)
+                as Box<
+                    dyn Body<Data = Bytes, Error = Box<dyn Error + Send + Sync>> + Unpin + Send,
+                >)
             .unwrap());
     }
 
@@ -90,10 +99,23 @@ where
         tracing::error!("Upstream error: {}", resp.status());
     }
 
-    // Read response body
-    let body_bytes = resp.into_body().collect().await?.to_bytes();
+    // Forward response body without collecting
+    let (parts, body) = resp.into_parts();
+    let mapped_body = body.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>);
+    let mut builder = Response::builder().status(parts.status);
+    for (k, v) in &parts.headers {
+        builder = builder.header(k.clone(), v.clone());
+    }
+    let response = builder
+        .body(Box::new(mapped_body)
+            as Box<
+                dyn Body<Data = Bytes, Error = Box<dyn Error + Send + Sync>> + Unpin + Send,
+            >)
+        .unwrap();
 
-    Ok(Response::new(Full::new(body_bytes)))
+    tracing::info!("Response status: {}", parts.status);
+
+    Ok(response)
 }
 
 #[cfg(test)]
