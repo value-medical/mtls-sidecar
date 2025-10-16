@@ -49,6 +49,7 @@ unless noted.
 - Upstream is HTTP-only, accessible via localhost.
 - Runs as non-root user (UID 1000).
 - Supports HTTP/1.1 and HTTP/2; TLS 1.2+ with secure ciphers.
+- Certificates are PEM-encoded PKCS#8.
 
 ## Secret Handling
 
@@ -329,42 +330,6 @@ Prevent host header injection vulnerabilities.
 - Tests:
     - Unit test: Various upstream URLs, assert correct host header.
     - Integration test: Proxy to HTTPS upstream, verify correct host header.
-
-### Step 14: Support Multiple Key Formats
-
-Extend compatibility for different private key formats.
-
-- Problem: Only PKCS#8 keys supported in `tls_manager.rs`.
-- Fix: Add support for PKCS#1 (RSA) and other formats by trying multiple parsers: `pkcs8_private_keys()`, `rsa_private_keys()`, etc.
-- Update key loading to attempt different formats in order.
-- Add tracing: Log key format detected.
-- Tests:
-    - Unit test: Load PKCS#1 key, assert success.
-    - Integration test: Server with PKCS#1 key, verify TLS handshake.
-
-### Step 15: Refine File Watcher Triggers
-
-Reduce unnecessary reloads by being more specific.
-
-- Problem: Watcher triggers on any `.crt/.key/.pem` file, even irrelevant ones.
-- Fix: Make watched file patterns configurable or match exactly the files used (e.g., only specific filenames like `tls.crt`).
-- Update `is_relevant_event()` to check exact filenames or make it configurable via env var.
-- Add tracing: Log which file triggered reload.
-- Tests:
-    - Unit test: Events on irrelevant files, assert no reload triggered.
-    - Integration test: Modify irrelevant file, verify no reload.
-
-### Step 16: Configurable Timeouts
-
-Allow customization of timeouts for better adaptability.
-
-- Problem: Readiness check timeout hardcoded to 1s in `monitoring.rs`.
-- Fix: Add `readiness_timeout_secs: u64` to `Config`, parse from env `READINESS_TIMEOUT_SECS` default 1.
-- Update ready_handler to use configurable timeout.
-- Add tracing: Log timeout value.
-- Tests:
-    - Unit test: Config with different timeouts, assert used.
-    - Integration test: Slow upstream, verify timeout behavior.
 
 ### Step 17: Fix Test Port Conflicts
 
