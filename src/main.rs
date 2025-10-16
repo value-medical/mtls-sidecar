@@ -9,6 +9,7 @@ use tokio_rustls::TlsAcceptor;
 mod config;
 mod proxy;
 mod tls_manager;
+mod watcher;
 
 use tls_manager::TlsManager;
 
@@ -38,6 +39,16 @@ async fn main() -> Result<()> {
     );
     tracing::info!("TLS loaded");
 
+    // Start file watcher
+    let cert_dir = config.cert_dir.clone();
+    let ca_dir = config.ca_dir.clone();
+    let watcher_tls_manager = Arc::clone(&tls_manager);
+    tokio::spawn(async move {
+        if let Err(e) = watcher::start_watcher(&cert_dir, &ca_dir, watcher_tls_manager).await {
+            tracing::error!("Watcher error: {:?}", e);
+        }
+    });
+
     // Bind to configured port
     let addr = format!("0.0.0.0:{}", config.tls_listen_port);
     let listener = TcpListener::bind(&addr)
@@ -53,7 +64,8 @@ async fn main() -> Result<()> {
         let inject = inject_headers;
 
         tokio::spawn(async move {
-            let acceptor = TlsAcceptor::from(Arc::clone(&tls_manager.config));
+            let current_config = tls_manager.config.read().await.clone();
+            let acceptor = TlsAcceptor::from(current_config);
 
             let stream = acceptor.accept(stream).await.unwrap();
             tracing::info!("Client connected");
