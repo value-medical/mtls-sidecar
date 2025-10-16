@@ -45,7 +45,7 @@ where
     }
 
     // Build upstream URI
-    let uri = parts.uri.clone();
+    let uri = parts.uri;
     let path_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let upstream_uri_str = format!("{}{}", upstream_url.trim_end_matches('/'), path_query);
     let upstream_uri = match upstream_uri_str.parse::<Uri>() {
@@ -83,7 +83,7 @@ where
 
     // Copy headers from original request
     for (key, value) in parts.headers.iter() {
-        upstream_req_builder = upstream_req_builder.header(key.clone(), value.clone());
+        upstream_req_builder = upstream_req_builder.header(key, value);
     }
 
     // Override host header
@@ -119,7 +119,7 @@ where
 
     let mut builder = Response::builder().status(parts.status);
     for (k, v) in parts.headers.iter() {
-        builder = builder.header(k.clone(), v.clone());
+        builder = builder.header(k, v);
     }
 
     let response = builder.body(proxied_body).map_err(|e| anyhow::anyhow!(e))?;
