@@ -8,11 +8,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-mod config;
-mod monitoring;
-mod proxy;
-mod tls_manager;
-mod watcher;
+use mtls_sidecar::{config, monitoring, proxy, tls_manager, watcher};
 
 use tls_manager::TlsManager;
 

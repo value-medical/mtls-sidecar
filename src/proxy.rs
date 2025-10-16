@@ -3,28 +3,21 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Body, header::HOST, http::Uri, Request, Response, StatusCode};
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
-use std::error::Error;
-use std::sync::Arc;
 use x509_parser::prelude::*;
 
+use crate::http_client_like::{BodyError, HttpClientLike, ProxiedBody};
 use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
 
-type BodyError = Box<dyn Error + Send + Sync>;
-
-type ProxiedBody = BoxBody<Bytes, BodyError>;
-
-type HttpClient<B> = Client<HttpConnector, B>;
-
-pub async fn handler<B>(
+pub async fn handler<B, C>(
     req: Request<B>,
     upstream_url: &str,
     inject_client_headers: bool,
-    client: Arc<HttpClient<B>>,
+    client: C,
 ) -> Result<Response<ProxiedBody>>
 where
-    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B: Body<Data = Bytes>,
     B::Error: Into<BodyError>,
+    C: HttpClientLike<B>,
 {
     let (parts, body) = req.into_parts();
 
@@ -61,6 +54,15 @@ where
         .method(parts.method.clone())
         .uri(upstream_uri.clone());
 
+    // Copy headers from original request
+    for (key, value) in parts.headers.iter() {
+        // Filter out X-Client- headers to avoid injection
+        if key.as_str().starts_with("x-client-") {
+            continue;
+        }
+        upstream_req_builder = upstream_req_builder.header(key, value);
+    }
+
     // If inject_client_headers, parse cert and add headers
     if inject_client_headers {
         if let Some(cert_der) = client_cert {
@@ -81,11 +83,6 @@ where
         }
     }
 
-    // Copy headers from original request
-    for (key, value) in parts.headers.iter() {
-        upstream_req_builder = upstream_req_builder.header(key, value);
-    }
-
     // Override host header
     let mut host_port = format!("http://{}", upstream_uri.host().unwrap());
     if let Some(port) = upstream_uri.port_u16() {
@@ -97,13 +94,7 @@ where
     let upstream_req = upstream_req_builder
         .body(body)
         .map_err(|e| anyhow::anyhow!(e))?;
-    let resp = match client.request(upstream_req).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::error!("Upstream request error: {:?}", e);
-            return Err(anyhow::anyhow!(e.to_string()));
-        }
-    };
+    let resp = client.request(upstream_req).await?;
 
     tracing::info!("Proxied request {} {}", parts.method.clone(), uri);
     REQUESTS_TOTAL.inc();
@@ -114,8 +105,7 @@ where
 
     // Forward response
     let (parts, body) = resp.into_parts();
-    let mapped_body = body.map_err(BodyError::from);
-    let proxied_body: ProxiedBody = BoxBody::new(mapped_body);
+    let proxied_body = body;
 
     let mut builder = Response::builder().status(parts.status);
     for (k, v) in parts.headers.iter() {
@@ -133,21 +123,42 @@ where
 mod tests {
     use super::*;
     use http_body_util::Empty;
-    use hyper_util::rt::TokioExecutor;
     use rcgen::{CertificateParams, DnType, KeyPair};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct MockClient;
+
+    impl<B> HttpClientLike<B> for MockClient {
+        fn request(
+            &self,
+            _req: Request<B>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<Response<ProxiedBody>, hyper_util::client::legacy::Error>,
+                    > + Send,
+            >,
+        > {
+            Box::pin(std::future::ready({
+                let body = Full::new(Bytes::from("OK")).map_err(Into::<BodyError>::into);
+                let proxied_body = BoxBody::new(body);
+                Ok(Response::builder().status(200).body(proxied_body).unwrap())
+            }))
+        }
+    }
 
     #[tokio::test]
     async fn test_handler_missing_cert() {
-        let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
         let req = Request::new(Empty::<Bytes>::new());
-        let resp = handler(req, "http://localhost:8080", false, client)
+        let resp = handler(req, "http://localhost:8080", false, MockClient)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn test_handler_with_cert_no_injection() {
+    async fn test_handler_with_cert_mock() {
         // Create a mock cert
         let mut params = CertificateParams::new(vec![]).unwrap();
         params
@@ -163,11 +174,9 @@ mod tests {
         let mut req = Request::new(Empty::<Bytes>::new());
         req.extensions_mut().insert(cert_der);
 
-        // Since upstream is not running, it will fail, but we can check if it tries to connect
-        // For this test, just ensure it doesn't return UNAUTHORIZED
-        let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-        let result = handler(req, "http://localhost:8080", false, client).await;
-        // It should try to proxy and fail with connection error, not UNAUTHORIZED
-        assert!(result.is_err()); // Since no upstream
+        let result = handler(req, "http://localhost:8080", false, MockClient).await;
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
