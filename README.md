@@ -418,7 +418,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mtls-sidecar-demo
-  namespace: default
 spec:
   replicas: 1
   selector:
@@ -433,24 +432,32 @@ spec:
         - name: app
           image: traefik/whoami
           ports:
-            - containerPort: 8080
+            - containerPort: 80
               name: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 20
         - name: mtls-sidecar
-          image: value-medical/mtls-sidecar:v1
+          image: mtls-sidecar
+          imagePullPolicy: Always
           ports:
             - containerPort: 8443
               name: https
             - containerPort: 8081
               name: mtls-monitor
           env:
+            - name: RUST_LOG
+              value: debug
             - name: UPSTREAM_URL
-              value: "http://localhost:8080"
+              value: "http://localhost"
+            - name: UPSTREAM_READINESS_URL
+              value: "http://localhost/health"
           volumeMounts:
             - name: server-tls-volume
               mountPath: /etc/certs
-              readOnly: true
-            - name: ca-volume
-              mountPath: /etc/ca
               readOnly: true
           readinessProbe:
             httpGet:
@@ -467,10 +474,7 @@ spec:
       volumes:
         - name: server-tls-volume
           secret:
-            secretName: server-tls-secret
-        - name: ca-volume
-          secret:
-            secretName: ca-secret
+            secretName: sidecar-demo-mtls
 ```
 
 Test with:
