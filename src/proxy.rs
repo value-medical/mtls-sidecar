@@ -126,6 +126,7 @@ mod tests {
     use rcgen::{CertificateParams, DnType, KeyPair};
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
 
     struct MockClient;
 
@@ -140,6 +141,34 @@ mod tests {
                     > + Send,
             >,
         > {
+            Box::pin(std::future::ready({
+                let body = Full::new(Bytes::from("OK")).map_err(Into::<BodyError>::into);
+                let proxied_body = BoxBody::new(body);
+                Ok(Response::builder().status(200).body(proxied_body).unwrap())
+            }))
+        }
+    }
+
+    struct CapturingClient {
+        captured_headers: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl<B> HttpClientLike<B> for CapturingClient {
+        fn request(
+            &self,
+            req: Request<B>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<Response<ProxiedBody>, hyper_util::client::legacy::Error>,
+                    > + Send,
+            >,
+        > {
+            let mut headers = Vec::new();
+            for (k, v) in req.headers() {
+                headers.push((k.as_str().to_lowercase(), v.to_str().unwrap().to_string()));
+            }
+            *self.captured_headers.lock().unwrap() = headers;
             Box::pin(std::future::ready({
                 let body = Full::new(Bytes::from("OK")).map_err(Into::<BodyError>::into);
                 let proxied_body = BoxBody::new(body);
@@ -178,5 +207,83 @@ mod tests {
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_filter_x_client_headers() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = CapturingClient {
+            captured_headers: captured.clone(),
+        };
+
+        let mut req = Request::new(Empty::<Bytes>::new());
+        req.headers_mut()
+            .insert("x-client-test", "value".parse().unwrap());
+        req.headers_mut()
+            .insert("other-header", "keep".parse().unwrap());
+
+        // Add cert
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "test-client");
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        req.extensions_mut().insert(cert_der);
+
+        let result = handler(req, "http://localhost:8080", false, client).await;
+        assert!(result.is_ok());
+
+        let captured_headers = captured.lock().unwrap();
+        // Check that x-client-test is not present
+        assert!(!captured_headers
+            .iter()
+            .any(|(k, _)| k == "x-client-test"));
+        // Check that other-header is present
+        assert!(captured_headers
+            .iter()
+            .any(|(k, v)| k == "other-header" && v == "keep"));
+    }
+
+    #[tokio::test]
+    async fn test_inject_x_client_headers() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = CapturingClient {
+            captured_headers: captured.clone(),
+        };
+
+        let mut req = Request::new(Empty::<Bytes>::new());
+        req.headers_mut()
+            .insert("x-client-test", "value".parse().unwrap());
+
+        // Add cert
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "test-client");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "Test Org");
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        req.extensions_mut().insert(cert_der);
+
+        let result = handler(req, "http://localhost:8080", true, client).await;
+        assert!(result.is_ok());
+
+        let captured_headers = captured.lock().unwrap();
+        // Check that x-client-test is not present
+        assert!(!captured_headers
+            .iter()
+            .any(|(k, _)| k == "x-client-test"));
+        // Check that injected headers are present
+        assert!(captured_headers
+            .iter()
+            .any(|(k, v)| k == "x-client-cn" && v == "test-client"));
+        assert!(captured_headers
+            .iter()
+            .any(|(k, v)| k == "x-client-subject" && v.contains("CN=test-client")));
     }
 }
