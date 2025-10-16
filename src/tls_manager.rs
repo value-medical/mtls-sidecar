@@ -50,6 +50,10 @@ impl TlsManager {
             ));
         };
 
+        // Log the paths being used
+        tracing::info!("Using certificate: {}", cert_path);
+        tracing::info!("Using private key: {}", key_path);
+
         // Read certificate
         let cert_pem = fs::read(&cert_path).await.context(format!(
             "Failed to read server certificate from {}",
