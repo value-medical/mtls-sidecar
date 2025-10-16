@@ -541,7 +541,10 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
         .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
         .build()?;
     let result = invalid_client.get("https://localhost:8446/").send().await;
-    assert!(result.is_err(), "Connection without client cert should fail");
+    assert!(
+        result.is_err(),
+        "Connection without client cert should fail"
+    );
 
     // Now try valid connection
     let valid_client = reqwest::Client::builder()
@@ -552,6 +555,112 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
         .build()?;
     let resp = valid_client.get("https://localhost:8446/").send().await?;
     assert_eq!(resp.status(), 200);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_proxy_large_response() -> Result<()> {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Generate CA, server cert, and client cert
+    let (ca_cert, ca_key) = generate_ca();
+    let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key);
+    let (client_cert, client_key) = generate_client_cert(&ca_cert, &ca_key);
+
+    // Write certs to temp dirs
+    let temp_dir = TempDir::new()?;
+    let cert_dir = temp_dir.path().join("certs");
+    let ca_dir = temp_dir.path().join("ca");
+    std::fs::create_dir(&cert_dir)?;
+    std::fs::create_dir(&ca_dir)?;
+
+    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
+    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
+
+    // Create large response body (10MB)
+    let large_body = Bytes::from(vec![b'A'; 10_000_000]);
+
+    // Start mock upstream on 8084
+    let upstream_listener = TcpListener::bind("127.0.0.1:8084").await?;
+    let body_clone = large_body.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let body = body_clone.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |_req| {
+                    let body = body.clone();
+                    async move { Ok::<_, hyper::Error>(Response::new(Full::new(body))) }
+                });
+                http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // Start sidecar on 8447
+    let config = mtls_sidecar::config::Config {
+        tls_listen_port: 8447,
+        upstream_url: "http://127.0.0.1:8084".to_string(),
+        upstream_readiness_url: "http://127.0.0.1:8084/ready".to_string(),
+        cert_dir: cert_dir.to_str().unwrap().to_string(),
+        ca_dir: ca_dir.to_str().unwrap().to_string(),
+        inject_client_headers: false,
+        monitor_port: 8081,
+        enable_metrics: false,
+    };
+    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+    let sidecar_listener = TcpListener::bind("127.0.0.1:8447").await?;
+    let upstream_url = config.upstream_url.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = sidecar_listener.accept().await.unwrap();
+            let tls_manager = Arc::clone(&tls_manager);
+            let upstream = upstream_url.clone();
+            tokio::spawn(async move {
+                let current_config = tls_manager.config.read().await.clone();
+                let acceptor = TlsAcceptor::from(current_config);
+                let stream = acceptor.accept(stream).await.unwrap();
+                let (_, server_conn) = stream.get_ref();
+                let client_cert = server_conn
+                    .peer_certificates()
+                    .and_then(|certs| certs.first().cloned());
+                let service = service_fn(move |mut req| {
+                    if let Some(cert) = &client_cert {
+                        req.extensions_mut().insert(cert.clone());
+                    }
+                    let up = upstream.clone();
+                    async move { mtls_sidecar::proxy::handler(req, &up, false).await }
+                });
+                http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // Wait a bit
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Make request with client cert
+    let client = reqwest::Client::builder()
+        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
+        .identity(reqwest::Identity::from_pem(
+            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
+        )?)
+        .build()?;
+
+    let resp = client.get("https://localhost:8447/").send().await?;
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await?;
+    assert_eq!(text.len(), 10_000_000);
+    assert!(text.chars().all(|c| c == 'A'));
 
     Ok(())
 }
