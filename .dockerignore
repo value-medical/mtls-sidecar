@@ -1,4 +1,5 @@
 /.git
 /target
+/examples
 /*.yaml
 /README.md
