@@ -32,16 +32,16 @@ outbound connections.
 Configuration is via environment variables only, with sensible defaults for common setups. All vars are optional strings
 unless noted.
 
-| Variable                 | Default Value                 | Description                                                     |
-|--------------------------|-------------------------------|-----------------------------------------------------------------|
-| `TLS_LISTEN_PORT`        | `8443`                        | TCP port for inbound mTLS listener.                             |
-| `UPSTREAM_URL`           | `http://localhost:8080`       | Full URL for the proxy target.                                  |
-| `UPSTREAM_READINESS_URL` | `http://localhost:8080/ready` | URL for upstream readiness check.                               |
-| `CERT_DIR`               | `/etc/certs`                  | Directory containing server cert/key files.                     |
-| `CA_DIR`                 | `/etc/ca`                     | Directory containing the CA bundle file.                        |
-| `INJECT_CLIENT_HEADERS`  | `false`                       | If `true`, inject `X-Client-CN` and `X-Client-Subject` headers. |
-| `MONITOR_PORT`           | `8081`                        | Port for health probes and metrics.                             |
-| `ENABLE_METRICS`         | `false`                       | If `true`, expose Prometheus `/metrics` on the monitor port.    |
+| Variable                 | Default Value                 | Description                                                  |
+|--------------------------|-------------------------------|--------------------------------------------------------------|
+| `TLS_LISTEN_PORT`        | `8443`                        | TCP port for inbound mTLS listener.                          |
+| `UPSTREAM_URL`           | `http://localhost:8080`       | Full URL for the proxy target.                               |
+| `UPSTREAM_READINESS_URL` | `http://localhost:8080/ready` | URL for upstream readiness check.                            |
+| `CERT_DIR`               | `/etc/certs`                  | Directory containing server cert/key files.                  |
+| `CA_DIR`                 | `/etc/ca`                     | Directory containing the CA bundle file.                     |
+| `INJECT_CLIENT_HEADERS`  | `false`                       | If `true`, inject `X-Client-TLS-Info` header.                |
+| `MONITOR_PORT`           | `8081`                        | Port for health probes and metrics.                          |
+| `ENABLE_METRICS`         | `false`                       | If `true`, expose Prometheus `/metrics` on the monitor port. |
 
 ## Deployment Assumptions
 
@@ -62,13 +62,63 @@ Mount entire Secrets to directories; the sidecar auto-detects files:
 
 On load/reload failure, logs an error and retains the previous configuration.
 
+## Client Certificate Header Injection
+
+When `INJECT_CLIENT_HEADERS` is set to `true`, the sidecar extracts key details from the validated client certificate during mTLS termination and injects them into the forwarded HTTP request via a single custom header: `X-Client-TLS-Info`. This provides the upstream application with lightweight, pre-parsed x509 information (e.g., subject, SANs, hash) without requiring it to handle TLS or certificate parsing. All extraction occurs in the sidecar using Rust's `rustls` and `x509-parser` crates, ensuring containment of TLS concerns.
+
+The header value is a base64-encoded JSON object (for single-hop scenarios, which is the default in this minimal sidecar). This format avoids parsing complexities like quoting or delimiters in traditional schemes, relying only on universal base64 decoding followed by JSON parsing. The payload is compact (~200-500 bytes pre-encoding) and includes only authentication-relevant fields.
+
+### Header Format
+
+- **Header Name**: `X-Client-TLS-Info` (case-insensitive; value is opaque to intermediaries).
+- **Value**: Base64 (standard RFC 4648) of a compact JSON string. No line breaks or extra whitespace.
+- **Structure**: JSON object with string keys and values/arrays as shown below. Fields are derived directly from the client certificate's leaf (end-entity) after validation.
+
+#### Extracted Fields
+
+| Field        | Type          | Description                                                                 | Example Value                               |
+|--------------|---------------|-----------------------------------------------------------------------------|---------------------------------------------|
+| `subject`    | string        | Full distinguished name (DN) as RFC 2253 string, normalized by sidecar.     | `"CN=client.example.com,O=Acme"`            |
+| `uri_sans`   | array<string> | URI subject alternative names (SANs), e.g., for SPIFFE identities.          | `["spiffe://cluster/ns/default/sa/client"]` |
+| `dns_sans`   | array<string> | DNS subject alternative names (SANs).                                       | `["client.example.com"]`                    |
+| `hash`       | string        | SHA-256 hex digest of the certificate DER, prefixed with `"sha256:"`.       | `"sha256:abc123def456..."`                  |
+| `not_before` | string        | Issuance timestamp in ISO 8601 format.                                      | `"2025-01-01T00:00:00Z"`                    |
+| `not_after`  | string        | Expiry timestamp in ISO 8601 format.                                        | `"2026-01-01T00:00:00Z"`                    |
+| `serial`     | string        | Certificate serial number as hex string.                                    | `"0x1234567890abcdef"`                      |
+
+### Upstream Examples
+
+The format is designed for easy integration in common web service languages.
+Upstream code should validate the header presence and decode/parse safely (e.g., handle missing/invalid values gracefully).
+For minimal upstream examples, refer to the `examples/` directory.
+
+- **Java** (using Spring or similar):
+  ```java
+  import java.util.Base64;
+  import com.fasterxml.jackson.databind.ObjectMapper;
+  String header = request.getHeader("X-Client-TLS-Info");
+  if (header != null) {
+      String jsonStr = new String(Base64.getDecoder().decode(header));
+      Map<String, Object> info = new ObjectMapper().readValue(jsonStr, Map.class);
+      String clientSubject = (String) info.get("subject");
+      log.info("Client Subject: " + clientSubject);
+  }
+  ```
+
+### Security Considerations
+
+- **Trust Model**: Upstream should treat the header as trusted (sidecar validates the cert), verifying `hash` against a known trust store if required.
+- **Chain of Custody**: Suitable for single-hop scenarios; avoid forwarding to untrusted parties.
+- **Spoofing Prevention**: The sidecar strips this header on inbound requests to prevent client tampering.
+
+This feature unburdens upstream services while exposing just enough cert info for auth/audit.
+
 ## Performance and Security
 
 - Low overhead: <50MB RAM, <5% CPU at 1k req/s.
 - Graceful shutdown with 30s timeout.
 - Structured JSON logging for requests, reloads, and errors.
 - License: MIT.
-
 
 ## Building and Running
 

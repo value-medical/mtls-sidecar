@@ -1,5 +1,6 @@
 use anyhow::Result;
 use axum;
+use base64;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::server::conn::http1;
@@ -12,7 +13,9 @@ use rcgen::{CertificateParams, Issuer};
 use rcgen::DnType;
 use rcgen::KeyPair;
 use reqwest::Certificate;
+use serde_json::Value;
 use std::sync::Arc;
+use base64::Engine;
 use tempfile::TempDir;
 use time::Duration;
 use time::OffsetDateTime;
@@ -254,8 +257,15 @@ async fn test_proxy_with_header_injection() -> Result<()> {
     // Check if headers were received
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // Wait for async
     let headers = received_headers.lock().unwrap();
-    assert!(headers.iter().any(|h| h.starts_with("x-client-cn: client")));
-    assert!(headers.iter().any(|h| h.starts_with("x-client-subject:")));
+    let tls_info_header = headers.iter().find(|h| h.starts_with("x-client-tls-info:")).unwrap();
+    let b64_value = tls_info_header.strip_prefix("x-client-tls-info: ").unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64_value).unwrap();
+    let json_str = String::from_utf8(decoded).unwrap();
+    let info: Value = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(info["subject"], "CN=client");
+    assert!(info["dns_sans"].as_array().unwrap().contains(&Value::String("localhost".to_string())));
+    assert!(info["hash"].as_str().unwrap().starts_with("sha256:"));
+    assert!(info["serial"].as_str().unwrap().starts_with("0x"));
 
     Ok(())
 }
