@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
 
     // Start monitoring server
     if config.monitor_port != 0 {
-        let router = monitoring::create_router(&config);
+        let router = monitoring::create_router(&config, Arc::clone(&tls_manager));
         let addr = format!("0.0.0.0:{}", config.monitor_port);
         let listener = TcpListener::bind(&addr)
             .await

@@ -1,16 +1,19 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
 use rustls_pki_types::{pem::PemObject, PrivateKeyDer};
 use tokio::fs;
 use tokio::sync::RwLock;
+use x509_parser::parse_x509_certificate;
 
 use crate::config::Config;
 
 pub struct TlsManager {
     pub config: Arc<RwLock<Arc<ServerConfig>>>,
+    pub earliest_expiry: Arc<RwLock<Option<DateTime<Utc>>>>,
 }
 
 impl TlsManager {
@@ -110,6 +113,31 @@ impl TlsManager {
         Ok(ca_certs)
     }
 
+    fn compute_earliest_expiry(certs: &[rustls::pki_types::CertificateDer<'static>]) -> Option<DateTime<Utc>> {
+        let mut earliest: Option<DateTime<Utc>> = None;
+
+        for cert_der in certs {
+            match parse_x509_certificate(cert_der) {
+                Ok((_, cert)) => {
+                    let validity = cert.validity();
+                    let not_after_dt = validity.not_after.to_datetime();
+                    let expiry = chrono::DateTime::from_timestamp(not_after_dt.unix_timestamp(), 0)
+                        .unwrap_or_else(|| Utc::now()); // fallback if conversion fails
+
+                    earliest = Some(match earliest {
+                        Some(current_earliest) => current_earliest.min(expiry),
+                        None => expiry,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse certificate for expiry check: {:?}", e);
+                }
+            }
+        }
+
+        earliest
+    }
+
     fn build_server_config(
         certs: Vec<rustls::pki_types::CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
@@ -143,21 +171,27 @@ impl TlsManager {
     pub async fn new(config: &Config) -> Result<Self> {
         let (certs, key) = Self::load_cert_and_key(&config.cert_dir).await?;
         let ca_certs = Self::load_ca_certs(&config.cert_dir, &config.ca_dir).await?;
-        let server_config = Self::build_server_config(certs, key, ca_certs)?;
+        let server_config = Self::build_server_config(certs.clone(), key, ca_certs)?;
+        let earliest_expiry = Self::compute_earliest_expiry(&certs);
 
         Ok(TlsManager {
             config: Arc::new(RwLock::new(Arc::new(server_config))),
+            earliest_expiry: Arc::new(RwLock::new(earliest_expiry)),
         })
     }
 
     pub async fn reload(&self, cert_dir: &str, ca_dir: &str) -> Result<()> {
         let (certs, key) = Self::load_cert_and_key(cert_dir).await?;
         let ca_certs = Self::load_ca_certs(cert_dir, ca_dir).await?;
-        let server_config = Self::build_server_config(certs, key, ca_certs)?;
+        let server_config = Self::build_server_config(certs.clone(), key, ca_certs)?;
+        let earliest_expiry = Self::compute_earliest_expiry(&certs);
 
         // Update the config atomically
         let new_arc = Arc::new(server_config);
         *self.config.write().await = new_arc;
+
+        // Update earliest expiry
+        *self.earliest_expiry.write().await = earliest_expiry;
 
         Ok(())
     }
@@ -176,8 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tls_manager_new_with_valid_certs() {
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
-            .unwrap();
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
         let temp_dir = TempDir::new().unwrap();
         let cert_dir = temp_dir.path().join("certs");
