@@ -140,76 +140,46 @@ USER app
 ENTRYPOINT ["/usr/local/bin/mtls-sidecar"]
 ```
 
-To use in Kubernetes, mount VSO-managed Secrets and set env vars in the Deployment spec:
+## Testing
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: mtls-sidecar-demo
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mtls-sidecar-demo
-  template:
-    metadata:
-      labels:
-        app: mtls-sidecar-demo
-    spec:
-      containers:
-        - name: app
-          image: traefik/whoami
-          ports:
-            - containerPort: 80
-              name: http
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 80
-            initialDelaySeconds: 15
-            periodSeconds: 20
-        - name: mtls-sidecar
-          image: mtls-sidecar
-          imagePullPolicy: Always
-          ports:
-            - containerPort: 8443
-              name: https
-            - containerPort: 8081
-              name: mtls-monitor
-          env:
-            - name: RUST_LOG
-              value: debug
-            - name: UPSTREAM_URL
-              value: "http://localhost"
-            - name: UPSTREAM_READINESS_URL
-              value: "http://localhost/health"
-          volumeMounts:
-            - name: server-tls-volume
-              mountPath: /etc/certs
-              readOnly: true
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: 8081
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /live
-              port: 8081
-            initialDelaySeconds: 15
-            periodSeconds: 20
-      volumes:
-        - name: server-tls-volume
-          secret:
-            secretName: sidecar-demo-mtls
-```
+This example setup uses cert-manager and trust-manager to create test certificates and a trust bundle for mTLS testing.
+A ClusterIssuer named `ca-issuer` is assumed to already exist.
 
-Test with:
+1. Create a CA for server and client certs (could be separate CAs, but using one for simplicity):
+   ```sh
+   kubectl create -f examples/kubernetes/cert-ca.yaml
+   ```
+2. Create a ClusterIssuer that uses this CA:
+   ```sh
+   kubectl create -f examples/kubernetes/clusterissuer.yaml
+   ```
+3. Create a trust-manager Bundle to build a ConfigMap with the testing CA cert:
+   ```sh
+   kubectl create -f examples/kubernetes/bundle.yaml
+   ```
+4. Create a deployment that uses the sidecar:
+   ```sh
+   kubectl create -f examples/kubernetes/deploy.yaml
+   ```
+5. Create a service to expose the sidecar:
+   ```sh
+   kubectl create -f examples/kubernetes/svc.yaml
+   ```
+6. Create a test pod that uses curl to connect to the sidecar with mTLS:
+   ```sh
+   kubectl create -f examples/kubernetes/pod.yaml
+   ```
 
-```
-curl --cert client.crt --key client.key https://<pod-ip>:8443/
+The pod should complete successfully, indicating that the sidecar accepted the mTLS connection and forwarded the request to the upstream.
+
+Cleanup:
+```sh
+kubectl delete -f examples/kubernetes/pod.yaml
+kubectl delete -f examples/kubernetes/svc.yaml
+kubectl delete -f examples/kubernetes/deploy.yaml
+kubectl delete -f examples/kubernetes/bundle.yaml
+kubectl delete -f examples/kubernetes/clusterissuer.yaml
+kubectl delete -f examples/kubernetes/cert-ca.yaml
 ```
 
 ## Contributing

@@ -82,11 +82,11 @@ impl TlsManager {
     ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
         let mut ca_certs = Vec::new();
         // From ca_dir
-        if let Ok(ca_pem) = fs::read(format!("{}/ca-bundle.pem", ca_dir)).await {
+        if let Ok(ca_pem) = fs::read(format!("{}/ca-bundle.crt", ca_dir)).await {
             ca_certs.extend(
                 rustls_pemfile::certs(&mut ca_pem.as_slice())
                     .collect::<Result<Vec<_>, _>>()
-                    .context("Failed to parse CA bundle from ca-bundle.pem")?,
+                    .context("Failed to parse CA bundle from ca-bundle.crt")?,
             );
         } else if let Ok(ca_pem) = fs::read(format!("{}/ca.crt", ca_dir)).await {
             ca_certs.extend(
@@ -233,7 +233,7 @@ mod tests {
         // Write to files
         fs::write(cert_dir.join("tls.crt"), &end_entity_pem).unwrap();
         fs::write(cert_dir.join("tls.key"), &end_entity_key_pem).unwrap();
-        fs::write(ca_dir.join("ca-bundle.pem"), &ca_cert_pem).unwrap();
+        fs::write(ca_dir.join("ca-bundle.crt"), &ca_cert_pem).unwrap();
 
         // Test TlsManager::new
         let config = Config {
@@ -261,7 +261,7 @@ mod tests {
         // Write invalid PEM
         fs::write(cert_dir.join("tls.crt"), b"invalid cert").unwrap();
         fs::write(cert_dir.join("tls.key"), b"invalid key").unwrap();
-        fs::write(ca_dir.join("ca-bundle.pem"), b"invalid ca").unwrap();
+        fs::write(ca_dir.join("ca-bundle.crt"), b"invalid ca").unwrap();
 
         // Test TlsManager::new should fail
         let config = Config {
@@ -343,7 +343,7 @@ mod tests {
         // Write initial files
         fs::write(cert_dir.join("tls.crt"), &end_entity_pem).unwrap();
         fs::write(cert_dir.join("tls.key"), &end_entity_key_pem).unwrap();
-        fs::write(ca_dir.join("ca-bundle.pem"), &ca_cert_pem).unwrap();
+        fs::write(ca_dir.join("ca-bundle.crt"), &ca_cert_pem).unwrap();
 
         let config = Config {
             tls_listen_port: 8443,
@@ -368,7 +368,7 @@ mod tests {
         // Overwrite files
         fs::write(cert_dir.join("tls.crt"), &new_end_entity_pem).unwrap();
         fs::write(cert_dir.join("tls.key"), &new_end_entity_key_pem).unwrap();
-        fs::write(ca_dir.join("ca-bundle.pem"), &new_ca_cert_pem).unwrap();
+        fs::write(ca_dir.join("ca-bundle.crt"), &new_ca_cert_pem).unwrap();
 
         // Reload
         tls_manager

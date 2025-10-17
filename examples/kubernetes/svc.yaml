@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mtls-sidecar-demo
+spec:
+  selector:
+    app: mtls-sidecar-demo
+  ports:
+    - protocol: TCP
+      port: 443
+      targetPort: 8443
+

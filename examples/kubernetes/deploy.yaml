@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mtls-sidecar-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mtls-sidecar-demo
+  template:
+    metadata:
+      labels:
+        app: mtls-sidecar-demo
+    spec:
+      containers:
+        - name: app
+          image: traefik/whoami
+          ports:
+            - containerPort: 80
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 1
+            periodSeconds: 1
+        - name: mtls-sidecar
+          image: sebcvm/mtls-sidecar
+          ports:
+            - containerPort: 8443
+              name: https
+            - containerPort: 8081
+              name: mtls-monitor
+          env:
+            - name: RUST_LOG
+              value: debug
+            - name: UPSTREAM_URL
+              value: "http://localhost"
+            - name: UPSTREAM_READINESS_URL
+              value: "http://localhost/health"
+          volumeMounts:
+            - name: trust-bundle
+              mountPath: /etc/ca
+              readOnly: true
+            - name: server-certs
+              mountPath: /etc/certs
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8081
+            initialDelaySeconds: 1
+            periodSeconds: 1
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8081
+            initialDelaySeconds: 1
+            periodSeconds: 1
+      volumes:
+        - name: trust-bundle
+          configMap:
+            defaultMode: 420
+            name: testing-trust-bundle
+            optional: false
+        - name: server-certs
+          csi:
+            driver: csi.cert-manager.io
+            readOnly: true
+            volumeAttributes:
+              csi.cert-manager.io/issuer-name: testing-issuer
+              csi.cert-manager.io/issuer-kind: ClusterIssuer
+              csi.cert-manager.io/dns-names: "mtls-sidecar-demo.${POD_NAMESPACE}.svc.cluster.local,mtls-sidecar-demo"
+      imagePullSecrets:
+      - name: private-registry

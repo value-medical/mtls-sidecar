@@ -1,0 +1,19 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: testing-ca
+  namespace: cert-manager
+spec:
+  commonName: testing-ca
+  secretName: testing-ca
+  isCA: true
+  usages:
+    - server auth
+    - client auth
+  issuerRef:
+    kind: ClusterIssuer
+    name: ca-issuer
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always

@@ -1,0 +1,7 @@
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: testing-issuer
+spec:
+  ca:
+    secretName: testing-ca
