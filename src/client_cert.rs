@@ -88,14 +88,24 @@ mod tests {
         let result_builder = inject_client_headers(builder, &cert_der);
 
         let req = result_builder.body(()).unwrap();
-        let header_value = req.headers().get("X-Client-TLS-Info").unwrap().to_str().unwrap();
+        let header_value = req
+            .headers()
+            .get("X-Client-TLS-Info")
+            .unwrap()
+            .to_str()
+            .unwrap();
 
-        let decoded = base64::engine::general_purpose::STANDARD.decode(header_value).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(header_value)
+            .unwrap();
         let json_str = String::from_utf8(decoded).unwrap();
         let info: Value = serde_json::from_str(&json_str).unwrap();
 
         assert_eq!(info["subject"], "CN=test-client, O=Test Org");
-        assert!(info["dns_sans"].as_array().unwrap().contains(&Value::String("example.com".to_string())));
+        assert!(info["dns_sans"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("example.com".to_string())));
         assert!(info["uri_sans"].as_array().unwrap().is_empty());
         assert!(info["hash"].as_str().unwrap().starts_with("sha256:"));
         assert!(info["serial"].as_str().unwrap().starts_with("0x"));
@@ -118,9 +128,16 @@ mod tests {
         let result_builder = inject_client_headers(builder, &cert_der);
 
         let req = result_builder.body(()).unwrap();
-        let header_value = req.headers().get("X-Client-TLS-Info").unwrap().to_str().unwrap();
+        let header_value = req
+            .headers()
+            .get("X-Client-TLS-Info")
+            .unwrap()
+            .to_str()
+            .unwrap();
 
-        let decoded = base64::engine::general_purpose::STANDARD.decode(header_value).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(header_value)
+            .unwrap();
         let json_str = String::from_utf8(decoded).unwrap();
         let info: Value = serde_json::from_str(&json_str).unwrap();
 

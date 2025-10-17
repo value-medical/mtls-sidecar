@@ -137,13 +137,13 @@ where
 mod tests {
     use super::*;
     use base64;
+    use base64::Engine;
     use http_body_util::Empty;
     use rcgen::{CertificateParams, DnType, KeyPair};
     use serde_json::Value;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
-    use base64::Engine;
 
     struct MockClient;
 
@@ -292,9 +292,14 @@ mod tests {
         // Check that x-client-test is not present
         assert!(!captured_headers.iter().any(|(k, _)| k == "x-client-test"));
         // Check that injected header is present
-        let tls_info_header = captured_headers.iter().find(|(k, _)| k == "x-client-tls-info").map(|(_, v)| v);
+        let tls_info_header = captured_headers
+            .iter()
+            .find(|(k, _)| k == "x-client-tls-info")
+            .map(|(_, v)| v);
         assert!(tls_info_header.is_some());
-        let decoded = base64::engine::general_purpose::STANDARD.decode(tls_info_header.unwrap()).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(tls_info_header.unwrap())
+            .unwrap();
         let json_str = String::from_utf8(decoded).unwrap();
         let info: Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(info["subject"], "CN=test-client, O=Test Org");

@@ -24,7 +24,6 @@ axum = { version = "0.8", features = ["tokio"] }
 prometheus = "0.14"
 lazy_static = "1.4"
 rustls-pki-types = "1.12.0"
-pem = "3.0.6"
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1.0"
 base64 = "0.22"
@@ -36,6 +35,7 @@ rcgen = "0.14"
 time = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 portpicker = "0.1"
+serde = { version = "1.0", features = ["derive"] }
 
 [profile.release]
 lto = true
