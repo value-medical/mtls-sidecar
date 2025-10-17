@@ -1,4 +1,5 @@
 use anyhow::Result;
+use axum;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::server::conn::http1;
@@ -742,6 +743,106 @@ async fn test_invalid_config_exits() -> Result<()> {
     assert!(stderr.contains("Invalid TLS_LISTEN_PORT"));
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_readiness_probe_certificate_expiry() -> Result<()> {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Pick dynamic ports
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
+    let monitor_port = portpicker::pick_unused_port().expect("No free port");
+
+    // Generate CA and EXPIRED server cert
+    let (ca_cert, issuer) = generate_ca();
+    let (server_cert, server_key) = generate_expired_server_cert(&issuer);
+
+    // Write certs to temp dirs
+    let temp_dir = TempDir::new()?;
+    let cert_dir = temp_dir.path().join("certs");
+    let ca_dir = temp_dir.path().join("ca");
+    std::fs::create_dir(&cert_dir)?;
+    std::fs::create_dir(&ca_dir)?;
+
+    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
+    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
+
+    // Start mock upstream that responds to readiness
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|req| async move {
+                    if req.uri().path() == "/ready" {
+                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("OK"))))
+                    } else {
+                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("Hello"))))
+                    }
+                });
+                http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // Start sidecar
+    let config = mtls_sidecar::config::Config {
+        tls_listen_port: sidecar_port,
+        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
+        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
+        cert_dir: cert_dir.to_str().unwrap().to_string(),
+        ca_dir: ca_dir.to_str().unwrap().to_string(),
+        inject_client_headers: false,
+        monitor_port,
+        enable_metrics: false,
+    };
+    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+
+    // Start monitoring server
+    let router = mtls_sidecar::monitoring::create_router(&config, Arc::clone(&tls_manager));
+    let monitor_addr = format!("127.0.0.1:{}", monitor_port);
+    let monitor_listener = TcpListener::bind(&monitor_addr).await?;
+    tokio::spawn(async move {
+        axum::serve(monitor_listener, router).await.unwrap();
+    });
+
+    // Wait for servers to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Hit the readiness endpoint - should return 503 due to expired certificate
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/ready", monitor_port))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 503);
+
+    Ok(())
+}
+
+fn generate_expired_server_cert(
+    issuer: &Issuer<KeyPair>,
+) -> (rcgen::Certificate, KeyPair) {
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "localhost");
+    params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+    // Set validity to yesterday (expired)
+    let yesterday = OffsetDateTime::now_utc().checked_sub(Duration::new(86400, 0)).unwrap();
+    params.not_before = yesterday.checked_sub(Duration::new(86400, 0)).unwrap(); // 2 days ago
+    params.not_after = yesterday; // yesterday
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = params.signed_by(&key_pair, issuer).unwrap();
+    (cert, key_pair)
 }
 
 fn validity_period() -> (OffsetDateTime, OffsetDateTime) {
