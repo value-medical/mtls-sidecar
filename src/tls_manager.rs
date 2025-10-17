@@ -113,7 +113,9 @@ impl TlsManager {
         Ok(ca_certs)
     }
 
-    fn compute_earliest_expiry(certs: &[rustls::pki_types::CertificateDer<'static>]) -> Option<DateTime<Utc>> {
+    fn compute_earliest_expiry(
+        certs: &[rustls::pki_types::CertificateDer<'static>],
+    ) -> Option<DateTime<Utc>> {
         let mut earliest: Option<DateTime<Utc>> = None;
 
         for cert_der in certs {
@@ -210,7 +212,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_tls_manager_new_with_valid_certs() {
-        let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
 
         let temp_dir = TempDir::new().unwrap();
         let cert_dir = temp_dir.path().join("certs");

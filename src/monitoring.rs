@@ -1,3 +1,5 @@
+use crate::config::Config;
+use crate::tls_manager::TlsManager;
 use axum::{
     body::Body as AxumBody,
     http::{Request, StatusCode},
@@ -13,9 +15,6 @@ use lazy_static::lazy_static;
 use prometheus::{register_int_counter, Encoder, IntCounter, TextEncoder};
 use std::sync::Arc;
 use std::time::Duration;
-
-use crate::config::Config;
-use crate::tls_manager::TlsManager;
 
 lazy_static! {
     pub static ref TLS_RELOADS_TOTAL: IntCounter =
@@ -72,12 +71,12 @@ async fn ready_handler(
     req: Request<AxumBody>,
     readiness_url: String,
     tls_manager: Arc<TlsManager>,
-) -> Result<&'static str, axum::http::StatusCode> {
+) -> Result<&'static str, StatusCode> {
     tracing::info!("Readiness probe called");
 
     // Check certificate expiry
     if let Err(_) = check_certificate_expiry(&tls_manager).await {
-        return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
     let client = Client::builder(TokioExecutor::new()).build_http();
@@ -88,17 +87,17 @@ async fn ready_handler(
     }
     let request = builder
         .body(Empty::<Bytes>::new())
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let response = tokio::time::timeout(Duration::from_secs(1), client.request(request))
         .await
-        .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)?
-        .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     if response.status().is_success() {
         Ok("OK")
     } else {
-        Err(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+        Err(StatusCode::SERVICE_UNAVAILABLE)
     }
 }
 
@@ -116,7 +115,6 @@ async fn metrics_handler() -> Result<String, StatusCode> {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
@@ -125,6 +123,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::spawn;
     use tokio::sync::RwLock;
+    use {Request, StatusCode};
 
     #[derive(Debug)]
     struct DummyResolver;
