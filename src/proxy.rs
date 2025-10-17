@@ -4,8 +4,8 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::header::HOST;
 use hyper::{body::Body, http::Uri, Request, Response, StatusCode};
-use x509_parser::prelude::*;
 
+use crate::client_cert;
 use crate::http_client_like::{BodyError, HttpClientLike, ProxiedBody};
 use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
 
@@ -86,20 +86,7 @@ where
     // If inject_client_headers, parse cert and add headers
     if inject_client_headers {
         if let Some(cert_der) = client_cert {
-            if let Ok((_, cert)) = X509Certificate::from_der(cert_der.as_ref()) {
-                let subject = cert.subject().to_string();
-                let cn = cert
-                    .subject()
-                    .iter_common_name()
-                    .next()
-                    .and_then(|cn| cn.as_str().ok())
-                    .unwrap_or("");
-
-                upstream_req_builder = upstream_req_builder
-                    .header("X-Client-CN", cn)
-                    .header("X-Client-Subject", subject);
-                tracing::info!("Injected client headers");
-            }
+            upstream_req_builder = client_cert::inject_client_headers(upstream_req_builder, cert_der);
         }
     }
 
@@ -149,11 +136,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64;
     use http_body_util::Empty;
     use rcgen::{CertificateParams, DnType, KeyPair};
+    use serde_json::Value;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use base64::Engine;
 
     struct MockClient;
 
@@ -301,12 +291,16 @@ mod tests {
         let captured_headers = captured.lock().unwrap();
         // Check that x-client-test is not present
         assert!(!captured_headers.iter().any(|(k, _)| k == "x-client-test"));
-        // Check that injected headers are present
-        assert!(captured_headers
-            .iter()
-            .any(|(k, v)| k == "x-client-cn" && v == "test-client"));
-        assert!(captured_headers
-            .iter()
-            .any(|(k, v)| k == "x-client-subject" && v.contains("CN=test-client")));
+        // Check that injected header is present
+        let tls_info_header = captured_headers.iter().find(|(k, _)| k == "x-client-tls-info").map(|(_, v)| v);
+        assert!(tls_info_header.is_some());
+        let decoded = base64::engine::general_purpose::STANDARD.decode(tls_info_header.unwrap()).unwrap();
+        let json_str = String::from_utf8(decoded).unwrap();
+        let info: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(info["subject"], "CN=test-client, O=Test Org");
+        assert!(info["dns_sans"].as_array().unwrap().is_empty());
+        assert!(info["uri_sans"].as_array().unwrap().is_empty());
+        assert!(info["hash"].as_str().unwrap().starts_with("sha256:"));
+        assert!(info["serial"].as_str().unwrap().starts_with("0x"));
     }
 }
