@@ -3,15 +3,12 @@ name = "mtls-sidecar"
 version = "0.1.0"
 edition = "2021"
 
-[build-dependencies]
-tonic-build = "0.12"
-
 [lib]
 name = "mtls_sidecar"
 
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
 rustls-pemfile = "2.1"
 tokio-rustls = "0.26"
 hyper = { version = "1.7", features = ["full"] }
@@ -32,26 +29,26 @@ serde_json = "1.0"
 base64 = "0.22"
 sha2 = "0.10"
 tempfile = "3.23"
-rcgen = "0.14"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 time = "0.3"
 portpicker = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 tempfile = "3.23"
-rcgen = "0.14"
 time = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 portpicker = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots-no-provider", "json"] }
 serde = { version = "1.0", features = ["derive"] }
-tonic = "0.12"
-prost = "0.13"
+tonic = { version = "0.14", default-features = false, features = ["transport", "router", "codegen"] }
+prost = "0.14"
+tonic-prost = "0.14.2"
 tokio-stream = "0.1"
-hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12", "logging", "fips"]}
+hyper-rustls = "0.27"
 
-[[bin]]
+[[bench]]
 name = "benchmark"
-path = "benchmark.rs"
+harness = false
+path = "benchmark/benchmark.rs"
 
 [profile.release]
 lto = true

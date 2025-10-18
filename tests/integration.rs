@@ -23,7 +23,8 @@ use tonic::{transport::Server, Request as TonicRequest, Response as TonicRespons
 
 // Define a simple gRPC service for testing
 pub mod hello_world {
-    tonic::include_proto!("helloworld");
+    include!("proto/gen/helloworld.rs");
+    include!("proto/gen/helloworld.tonic.rs");
 }
 
 use hello_world::greeter_server::{Greeter, GreeterServer};
@@ -47,15 +48,22 @@ impl Greeter for MyGreeter {
 
 use mtls_sidecar::tls_manager::TlsManager;
 
-#[tokio::test]
-async fn test_proxy_with_valid_cert() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .expect("Failed to install rustls crypto provider");
+struct TestSetup {
+    sidecar_port: u16,
+    client: reqwest::Client,
+    ca_cert: rcgen::Certificate,
+    client_cert: rcgen::Certificate,
+    client_key: KeyPair,
+}
 
-    // Pick dynamic ports
-    let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
-
+fn setup_certificates() -> Result<(
+    TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    rcgen::Certificate,
+    rcgen::Certificate,
+    KeyPair,
+)> {
     // Generate CA, server cert, and client cert
     let (ca_cert, issuer) = generate_ca();
     let (server_cert, server_key) = generate_server_cert(&issuer);
@@ -72,61 +80,145 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
     std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
 
-    // Start mock upstream
-    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = upstream_listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let service = service_fn(|_req| async {
-                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
-                        "Hello from upstream",
-                    ))))
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
+    Ok((temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key))
+}
+fn generate_ca() -> (rcgen::Certificate, Issuer<'static, KeyPair>) {
+    let mut params = CertificateParams::new(vec![]).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(DnType::OrganizationName, "Test CA");
+    let (yesterday, tomorrow) = validity_period();
+    params.not_before = yesterday;
+    params.not_after = tomorrow;
+    let key_pair = KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let issuer = Issuer::new(params, key_pair);
+    (cert, issuer)
+}
 
-    // Start sidecar
-    let config = mtls_sidecar::config::Config {
+fn generate_server_cert(issuer: &Issuer<KeyPair>) -> (rcgen::Certificate, KeyPair) {
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "localhost");
+    params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+    let (yesterday, tomorrow) = validity_period();
+    params.not_before = yesterday;
+    params.not_after = tomorrow;
+    let key_pair = KeyPair::generate().unwrap();
+    let cert = params.signed_by(&key_pair, issuer).unwrap();
+    (cert, key_pair)
+}
+
+fn generate_client_cert(issuer: &Issuer<KeyPair>) -> (rcgen::Certificate, KeyPair) {
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    params.distinguished_name.push(DnType::CommonName, "client");
+    params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    let (yesterday, tomorrow) = validity_period();
+    params.not_before = yesterday;
+    params.not_after = tomorrow;
+    let key_pair = KeyPair::generate().unwrap();
+    let cert = params.signed_by(&key_pair, &issuer).unwrap();
+    (cert, key_pair)
+}
+
+fn create_test_config(
+    upstream_port: u16,
+    sidecar_port: u16,
+    cert_dir: &str,
+    ca_dir: &str,
+    inject_client_headers: bool,
+    monitor_port: u16,
+) -> mtls_sidecar::config::Config {
+    mtls_sidecar::config::Config {
         tls_listen_port: sidecar_port,
         upstream_url: format!("http://127.0.0.1:{}", upstream_port),
         upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: cert_dir.to_str().unwrap().to_string(),
-        ca_dir: ca_dir.to_str().unwrap().to_string(),
-        inject_client_headers: false,
-        monitor_port: 8081,
+        cert_dir: cert_dir.to_string(),
+        ca_dir: ca_dir.to_string(),
+        inject_client_headers,
+        monitor_port,
         enable_metrics: false,
-    };
+    }
+}
+
+fn pick_ports() -> (u16, u16, u16) {
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
+    let monitor_port = portpicker::pick_unused_port().expect("No free port");
+    (upstream_port, sidecar_port, monitor_port)
+}
+
+async fn setup_test(
+    upstream_port: u16,
+    cert_dir: &str,
+    ca_dir: &str,
+    ca_cert: &rcgen::Certificate,
+    client_cert: &rcgen::Certificate,
+    client_key: KeyPair,
+    inject_headers: bool,
+    monitor_port: u16,
+) -> Result<(TestSetup, Arc<TlsManager>, mtls_sidecar::config::Config)> {
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
+    let config = create_test_config(
+        upstream_port,
+        sidecar_port,
+        cert_dir,
+        ca_dir,
+        inject_headers,
+        monitor_port,
+    );
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
-    let upstream_url = config.upstream_url.clone();
+    start_sidecar(&config, Arc::clone(&tls_manager)).await?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let client = create_client_builder_with_cert(ca_cert, client_cert, &client_key)?.build()?;
+    let setup = TestSetup {
+        sidecar_port,
+        client,
+        ca_cert: ca_cert.clone(),
+        client_cert: client_cert.clone(),
+        client_key,
+    };
+    Ok((setup, tls_manager, config))
+}
+
+async fn setup_basic_proxy_test(
+    upstream_response: Bytes,
+    inject_headers: bool,
+) -> Result<TestSetup> {
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let monitor_port = portpicker::pick_unused_port().expect("No free port");
+    let (_temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key) = setup_certificates()?;
+    start_basic_upstream(upstream_port, upstream_response).await?;
+    let (setup, _, _) = setup_test(
+        upstream_port,
+        cert_dir.to_str().unwrap(),
+        ca_dir.to_str().unwrap(),
+        &ca_cert,
+        &client_cert,
+        client_key,
+        inject_headers,
+        monitor_port,
+    ).await?;
+    Ok(setup)
+}
+
+async fn start_basic_upstream(port: u16, response: Bytes) -> Result<()> {
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let resp = response;
     tokio::spawn(async move {
         loop {
-            let (stream, _) = sidecar_listener.accept().await.unwrap();
-            let peer_addr = stream.peer_addr().ok();
-            let tls_manager = Arc::clone(&tls_manager);
-            let upstream = upstream_url.clone();
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let r = resp.clone();
             tokio::spawn(async move {
-                let current_config = tls_manager.config.read().await.clone();
-                let acceptor = TlsAcceptor::from(current_config);
-                let stream = acceptor.accept(stream).await.unwrap();
-                let (_, server_conn) = stream.get_ref();
-                let client_cert = server_conn
-                    .peer_certificates()
-                    .and_then(|certs| certs.first().cloned());
-                let service = service_fn(move |mut req| {
-                    if let Some(cert) = &client_cert {
-                        req.extensions_mut().insert(cert.clone());
-                    }
-                    let up = upstream.clone();
-                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    let addr = peer_addr;
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
+                let service = service_fn(move |_req| {
+                    let r = r.clone();
+                    async move { Ok::<_, hyper::Error>(Response::new(Full::new(r))) }
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -135,56 +227,11 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
             });
         }
     });
-
-    // Wait a bit
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Make request with client cert
-    let client = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
-        .identity(reqwest::Identity::from_pem(
-            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
-        )?)
-        .build()?;
-
-    let resp = client
-        .get(format!("https://localhost:{}/", sidecar_port))
-        .send()
-        .await?;
-    assert_eq!(resp.status(), 200);
-    let text = resp.text().await?;
-    assert_eq!(text, "Hello from upstream");
-
     Ok(())
 }
 
-#[tokio::test]
-async fn test_proxy_with_header_injection() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .expect("Failed to install rustls crypto provider");
-
-    // Pick dynamic ports
-    let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
-
-    // Generate CA, server cert, and client cert with CN
-    let (ca_cert, issuer) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&issuer);
-    let (client_cert, client_key) = generate_client_cert(&issuer);
-
-    // Write certs to temp dirs
-    let temp_dir = TempDir::new()?;
-    let cert_dir = temp_dir.path().join("certs");
-    let ca_dir = temp_dir.path().join("ca");
-    std::fs::create_dir(&cert_dir)?;
-    std::fs::create_dir(&ca_dir)?;
-
-    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
-    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
-
-    // Start mock upstream that echoes headers
-    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
+async fn start_header_echo_upstream(port: u16) -> Result<Arc<std::sync::Mutex<Vec<String>>>> {
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     let received_headers = Arc::new(std::sync::Mutex::new(Vec::new()));
     let headers_clone = Arc::clone(&received_headers);
     tokio::spawn(async move {
@@ -212,20 +259,38 @@ async fn test_proxy_with_header_injection() -> Result<()> {
             });
         }
     });
+    Ok(received_headers)
+}
 
-    // Start sidecar with injection enabled
-    let config = mtls_sidecar::config::Config {
-        tls_listen_port: sidecar_port,
-        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
-        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: cert_dir.to_str().unwrap().to_string(),
-        ca_dir: ca_dir.to_str().unwrap().to_string(),
-        inject_client_headers: true,
-        monitor_port: 8081,
-        enable_metrics: false,
-    };
-    let tls_manager = Arc::new(TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
+async fn start_readiness_upstream(port: u16) -> Result<()> {
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|req| async move {
+                    if req.uri().path() == "/ready" {
+                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("OK"))))
+                    } else {
+                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("Hello"))))
+                    }
+                });
+                auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    Ok(())
+}
+
+async fn start_sidecar(
+    config: &mtls_sidecar::config::Config,
+    tls_manager: Arc<TlsManager>,
+) -> Result<()> {
+    let sidecar_listener =
+        TcpListener::bind(format!("127.0.0.1:{}", config.tls_listen_port)).await?;
     let upstream_url = config.upstream_url.clone();
     let inject = config.inject_client_headers;
     tokio::spawn(async move {
@@ -234,7 +299,6 @@ async fn test_proxy_with_header_injection() -> Result<()> {
             let peer_addr = stream.peer_addr().ok();
             let tls_manager = Arc::clone(&tls_manager);
             let upstream = upstream_url.clone();
-            let inj = inject;
             tokio::spawn(async move {
                 let current_config = tls_manager.config.read().await.clone();
                 let acceptor = TlsAcceptor::from(current_config);
@@ -250,7 +314,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
                     let up = upstream.clone();
                     let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
                     let addr = peer_addr;
-                    async move { mtls_sidecar::proxy::handler(req, &up, inj, client, addr).await }
+                    async move { mtls_sidecar::proxy::handler(req, &up, inject, client, addr).await }
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -259,20 +323,61 @@ async fn test_proxy_with_header_injection() -> Result<()> {
             });
         }
     });
+    Ok(())
+}
 
-    // Wait a bit
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Make request with client cert
-    let client = reqwest::Client::builder()
+fn create_client_builder_with_cert(
+    ca_cert: &rcgen::Certificate,
+    client_cert: &rcgen::Certificate,
+    client_key: &KeyPair,
+) -> Result<reqwest::ClientBuilder> {
+    let builder = reqwest::Client::builder()
         .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
         .identity(reqwest::Identity::from_pem(
             format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
-        )?)
-        .build()?;
+        )?);
+    Ok(builder)
+}
 
-    let resp = client
-        .get(format!("https://localhost:{}/", sidecar_port))
+#[tokio::test]
+async fn test_proxy_with_valid_cert() -> Result<()> {
+    let setup = setup_basic_proxy_test(Bytes::from("Hello from upstream"), false).await?;
+
+    let resp = setup
+        .client
+        .get(format!("https://localhost:{}/", setup.sidecar_port))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await?;
+    assert_eq!(text, "Hello from upstream");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_proxy_with_header_injection() -> Result<()> {
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let monitor_port = portpicker::pick_unused_port().expect("No free port");
+
+    let (_temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key) = setup_certificates()?;
+
+    let received_headers = start_header_echo_upstream(upstream_port).await?;
+
+    let (setup, _, _) = setup_test(
+        upstream_port,
+        cert_dir.to_str().unwrap(),
+        ca_dir.to_str().unwrap(),
+        &ca_cert,
+        &client_cert,
+        client_key,
+        true,
+        monitor_port,
+    ).await?;
+
+    let resp = setup
+        .client
+        .get(format!("https://localhost:{}/", setup.sidecar_port))
         .send()
         .await?;
     assert_eq!(resp.status(), 200);
@@ -280,124 +385,45 @@ async fn test_proxy_with_header_injection() -> Result<()> {
     // Check if headers were received
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // Wait for async
     let headers = received_headers.lock().unwrap();
-    let tls_info_header = headers.iter().find(|h| h.starts_with("x-client-tls-info:")).unwrap();
+    let tls_info_header = headers
+        .iter()
+        .find(|h| h.starts_with("x-client-tls-info:"))
+        .unwrap();
     let b64_value = tls_info_header.strip_prefix("x-client-tls-info: ").unwrap();
-    let decoded = base64::engine::general_purpose::STANDARD.decode(b64_value).unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64_value)?;
     let json_str = String::from_utf8(decoded).unwrap();
     let info: Value = serde_json::from_str(&json_str).unwrap();
     assert_eq!(info["subject"], "CN=client");
-    assert!(info["dns_sans"].as_array().unwrap().contains(&Value::String("localhost".to_string())));
+    assert!(info["dns_sans"]
+        .as_array()
+        .unwrap()
+        .contains(&Value::String("localhost".to_string())));
     assert!(info["hash"].as_str().unwrap().starts_with("sha256:"));
     assert!(info["serial"].as_str().unwrap().starts_with("0x"));
 
     Ok(())
 }
 
-fn generate_ca() -> (rcgen::Certificate, Issuer<'static, KeyPair>) {
-    let mut params = CertificateParams::new(vec![]).unwrap();
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params
-        .distinguished_name
-        .push(DnType::OrganizationName, "Test CA");
-    let (yesterday, tomorrow) = validity_period();
-    params.not_before = yesterday;
-    params.not_after = tomorrow;
-    let key_pair = KeyPair::generate().unwrap();
-    let cert = params.self_signed(&key_pair).unwrap();
-    let issuer = Issuer::new(params, key_pair);
-    (cert, issuer)
-}
-
-fn generate_server_cert(
-    issuer: &Issuer<KeyPair>,
-) -> (rcgen::Certificate, KeyPair) {
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "localhost");
-    params
-        .extended_key_usages
-        .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
-    let (yesterday, tomorrow) = validity_period();
-    params.not_before = yesterday;
-    params.not_after = tomorrow;
-    let key_pair = KeyPair::generate().unwrap();
-    let cert = params.signed_by(&key_pair, issuer).unwrap();
-    (cert, key_pair)
-}
-
-fn generate_client_cert(
-    issuer: &Issuer<KeyPair>,
-) -> (rcgen::Certificate, KeyPair) {
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params.distinguished_name.push(DnType::CommonName, "client");
-    params
-        .extended_key_usages
-        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
-    let (yesterday, tomorrow) = validity_period();
-    params.not_before = yesterday;
-    params.not_after = tomorrow;
-    let key_pair = KeyPair::generate().unwrap();
-    let cert = params.signed_by(&key_pair, &issuer).unwrap();
-    (cert, key_pair)
-}
-
 #[tokio::test]
 async fn test_file_watching_reload() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .expect("Failed to install rustls crypto provider");
+    let (upstream_port, sidecar_port, monitor_port) = pick_ports();
 
-    // Pick dynamic ports
-    let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
-
-    // Generate initial CA, server cert, and client cert
-    let (ca_cert, issuer) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&issuer);
-    let (client_cert, client_key) = generate_client_cert(&issuer);
-
-    // Write initial certs to temp dirs
-    let temp_dir = TempDir::new()?;
-    let cert_dir = temp_dir.path().join("certs");
-    let ca_dir = temp_dir.path().join("ca");
-    std::fs::create_dir(&cert_dir)?;
-    std::fs::create_dir(&ca_dir)?;
-
-    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
-    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
+    let (_temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key) = setup_certificates()?;
 
     // Start mock upstream
-    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = upstream_listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let service = service_fn(|_req| async {
-                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("OK"))))
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
+    start_basic_upstream(upstream_port, Bytes::from("OK")).await?;
 
     // Start sidecar
-    let config = mtls_sidecar::config::Config {
-        tls_listen_port: sidecar_port,
-        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
-        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: cert_dir.to_str().unwrap().to_string(),
-        ca_dir: ca_dir.to_str().unwrap().to_string(),
-        inject_client_headers: false,
-        monitor_port: 8081,
-        enable_metrics: false,
-    };
+    let config = create_test_config(
+        upstream_port,
+        sidecar_port,
+        cert_dir.to_str().unwrap(),
+        ca_dir.to_str().unwrap(),
+        false,
+        monitor_port,
+    );
     let tls_manager = Arc::new(mtls_sidecar::tls_manager::TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
-    let upstream_url = config.upstream_url.clone();
     let watcher_tls_manager = Arc::clone(&tls_manager);
     let reload_tls_manager = Arc::clone(&tls_manager);
     let cert_dir_clone = config.cert_dir.clone();
@@ -411,47 +437,14 @@ async fn test_file_watching_reload() -> Result<()> {
     });
 
     // Spawn server
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = sidecar_listener.accept().await.unwrap();
-            let peer_addr = stream.peer_addr().ok();
-            let tls_manager = Arc::clone(&tls_manager);
-            let upstream = upstream_url.clone();
-            tokio::spawn(async move {
-                let current_config = tls_manager.config.read().await.clone();
-                let acceptor = TlsAcceptor::from(current_config);
-                let stream = acceptor.accept(stream).await.unwrap();
-                let (_, server_conn) = stream.get_ref();
-                let client_cert = server_conn
-                    .peer_certificates()
-                    .and_then(|certs| certs.first().cloned());
-                let service = service_fn(move |mut req| {
-                    if let Some(cert) = &client_cert {
-                        req.extensions_mut().insert(cert.clone());
-                    }
-                    let up = upstream.clone();
-                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    let addr = peer_addr;
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
+    start_sidecar(&config, Arc::clone(&tls_manager)).await?;
 
     // Wait for server to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Make initial request with old client cert
-    let old_client = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
-        .identity(reqwest::Identity::from_pem(
-            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
-        )?)
-        .build()?;
+    let old_client =
+        create_client_builder_with_cert(&ca_cert, &client_cert, &client_key)?.build()?;
     let resp = old_client
         .get(format!("https://localhost:{}/", sidecar_port))
         .send()
@@ -477,12 +470,8 @@ async fn test_file_watching_reload() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Try old client again - should fail because server now requires client cert verified by new CA
-    let old_client_permissive = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(new_ca_cert.pem().as_bytes())?)
-        .identity(reqwest::Identity::from_pem(
-            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
-        )?)
-        .build()?;
+    let old_client_permissive =
+        create_client_builder_with_cert(&new_ca_cert, &client_cert, &client_key)?.build()?;
     let result = old_client_permissive
         .get(format!("https://localhost:{}/", sidecar_port))
         .send()
@@ -495,17 +484,9 @@ async fn test_file_watching_reload() -> Result<()> {
     // Generate new client cert signed by new CA
     let (new_client_cert, new_client_key) = generate_client_cert(&issuer);
 
-    let new_client = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(new_ca_cert.pem().as_bytes())?)
-        .identity(reqwest::Identity::from_pem(
-            format!(
-                "{}{}",
-                new_client_cert.pem(),
-                new_client_key.serialize_pem()
-            )
-            .as_bytes(),
-        )?)
-        .build()?;
+    let new_client =
+        create_client_builder_with_cert(&new_ca_cert, &new_client_cert, &new_client_key)?
+            .build()?;
 
     let resp = new_client
         .get(format!("https://localhost:{}/", sidecar_port))
@@ -518,56 +499,23 @@ async fn test_file_watching_reload() -> Result<()> {
 
 #[tokio::test]
 async fn test_tls_handshake_failure_handling() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .expect("Failed to install rustls crypto provider");
+    let (upstream_port, sidecar_port, monitor_port) = pick_ports();
 
-    // Pick dynamic ports
-    let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
-
-    // Generate CA and server cert
-    let (ca_cert, issuer) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&issuer);
-
-    // Write certs to temp dirs
-    let temp_dir = TempDir::new()?;
-    let cert_dir = temp_dir.path().join("certs");
-    let ca_dir = temp_dir.path().join("ca");
-    std::fs::create_dir(&cert_dir)?;
-    std::fs::create_dir(&ca_dir)?;
-
-    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
-    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
+    let (_temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key) = setup_certificates()?;
 
     // Start mock upstream
-    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = upstream_listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let service = service_fn(|_req| async {
-                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("OK"))))
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
+    start_basic_upstream(upstream_port, Bytes::from("OK")).await?;
 
     // Start sidecar
-    let config = mtls_sidecar::config::Config {
-        tls_listen_port: sidecar_port,
-        upstream_url: format!("http://127.0.0.1:{}/grpc", upstream_port), // Add /grpc to identify gRPC test
-        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: cert_dir.to_str().unwrap().to_string(),
-        ca_dir: ca_dir.to_str().unwrap().to_string(),
-        inject_client_headers: false,
-        monitor_port: 8081,
-        enable_metrics: false,
-    };
+    let mut config = create_test_config(
+        upstream_port,
+        sidecar_port,
+        cert_dir.to_str().unwrap(),
+        ca_dir.to_str().unwrap(),
+        false,
+        monitor_port,
+    );
+    config.upstream_url = format!("http://127.0.0.1:{}/grpc", upstream_port);
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
     let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
     let upstream_url = config.upstream_url.clone();
@@ -595,9 +543,10 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                     let up = upstream.clone();
                     // For gRPC test, use HTTP/2 capable client
                     let client = if up.contains("grpc") {
-                        Arc::new(Client::builder(TokioExecutor::new()).build(
-                            hyper_util::client::legacy::connect::HttpConnector::new()
-                        ))
+                        Arc::new(
+                            Client::builder(TokioExecutor::new())
+                                .build(hyper_util::client::legacy::connect::HttpConnector::new()),
+                        )
                     } else {
                         Arc::new(Client::builder(TokioExecutor::new()).build_http())
                     };
@@ -615,9 +564,6 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     // Wait for server to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // Generate valid client cert
-    let (client_cert, client_key) = generate_client_cert(&issuer);
-
     // Try invalid connection (no client cert)
     let invalid_client = reqwest::Client::builder()
         .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
@@ -632,12 +578,8 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     );
 
     // Now try valid connection
-    let valid_client = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
-        .identity(reqwest::Identity::from_pem(
-            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
-        )?)
-        .build()?;
+    let valid_client =
+        create_client_builder_with_cert(&ca_cert, &client_cert, &client_key)?.build()?;
     let resp = valid_client
         .get(format!("https://localhost:{}/", sidecar_port))
         .send()
@@ -649,110 +591,14 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_large_response() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .expect("Failed to install rustls crypto provider");
-
-    // Pick dynamic ports
-    let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
-
-    // Generate CA, server cert, and client cert
-    let (ca_cert, issuer) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&issuer);
-    let (client_cert, client_key) = generate_client_cert(&issuer);
-
-    // Write certs to temp dirs
-    let temp_dir = TempDir::new()?;
-    let cert_dir = temp_dir.path().join("certs");
-    let ca_dir = temp_dir.path().join("ca");
-    std::fs::create_dir(&cert_dir)?;
-    std::fs::create_dir(&ca_dir)?;
-
-    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
-    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
-
     // Create large response body (10MB)
     let large_body = Bytes::from(vec![b'A'; 10_000_000]);
 
-    // Start mock upstream
-    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
-    let body_clone = large_body.clone();
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = upstream_listener.accept().await.unwrap();
-            let body = body_clone.clone();
-            tokio::spawn(async move {
-                let service = service_fn(move |_req| {
-                    let body = body.clone();
-                    async move { Ok::<_, hyper::Error>(Response::new(Full::new(body))) }
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
+    let setup = setup_basic_proxy_test(large_body, false).await?;
 
-    // Start sidecar
-    let config = mtls_sidecar::config::Config {
-        tls_listen_port: sidecar_port,
-        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
-        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: cert_dir.to_str().unwrap().to_string(),
-        ca_dir: ca_dir.to_str().unwrap().to_string(),
-        inject_client_headers: false,
-        monitor_port: 8081,
-        enable_metrics: false,
-    };
-    let tls_manager = Arc::new(TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
-    let upstream_url = config.upstream_url.clone();
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = sidecar_listener.accept().await.unwrap();
-            let peer_addr = stream.peer_addr().ok();
-            let tls_manager = Arc::clone(&tls_manager);
-            let upstream = upstream_url.clone();
-            tokio::spawn(async move {
-                let current_config = tls_manager.config.read().await.clone();
-                let acceptor = TlsAcceptor::from(current_config);
-                let stream = acceptor.accept(stream).await.unwrap();
-                let (_, server_conn) = stream.get_ref();
-                let client_cert = server_conn
-                    .peer_certificates()
-                    .and_then(|certs| certs.first().cloned());
-                let service = service_fn(move |mut req| {
-                    if let Some(cert) = &client_cert {
-                        req.extensions_mut().insert(cert.clone());
-                    }
-                    let up = upstream.clone();
-                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    let addr = peer_addr;
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
-
-    // Wait a bit
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Make request with client cert
-    let client = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
-        .identity(reqwest::Identity::from_pem(
-            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
-        )?)
-        .build()?;
-
-    let resp = client
-        .get(format!("https://localhost:{}/", sidecar_port))
+    let resp = setup
+        .client
+        .get(format!("https://localhost:{}/", setup.sidecar_port))
         .send()
         .await?;
     assert_eq!(resp.status(), 200);
@@ -787,17 +633,13 @@ async fn test_invalid_config_exits() -> Result<()> {
 
 #[tokio::test]
 async fn test_readiness_probe_certificate_expiry() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .expect("Failed to install rustls crypto provider");
-
-    // Pick dynamic ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
     let monitor_port = portpicker::pick_unused_port().expect("No free port");
 
     // Generate CA and EXPIRED server cert
     let (ca_cert, issuer) = generate_ca();
     let (server_cert, server_key) = generate_expired_server_cert(&issuer);
+    let (client_cert, client_key) = generate_client_cert(&issuer);
 
     // Write certs to temp dirs
     let temp_dir = TempDir::new()?;
@@ -810,39 +652,18 @@ async fn test_readiness_probe_certificate_expiry() -> Result<()> {
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
     std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
 
-    // Start mock upstream that responds to readiness
-    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = upstream_listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let service = service_fn(|req| async move {
-                    if req.uri().path() == "/ready" {
-                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("OK"))))
-                    } else {
-                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("Hello"))))
-                    }
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
+    start_readiness_upstream(upstream_port).await?;
 
-    // Start sidecar
-    let config = mtls_sidecar::config::Config {
-        tls_listen_port: sidecar_port,
-        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
-        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: cert_dir.to_str().unwrap().to_string(),
-        ca_dir: ca_dir.to_str().unwrap().to_string(),
-        inject_client_headers: false,
+    let (_setup, tls_manager, config) = setup_test(
+        upstream_port,
+        cert_dir.to_str().unwrap(),
+        ca_dir.to_str().unwrap(),
+        &ca_cert,
+        &client_cert,
+        client_key,
+        false,
         monitor_port,
-        enable_metrics: false,
-    };
-    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+    ).await?;
 
     // Start monitoring server
     let router = mtls_sidecar::monitoring::create_router(&config, Arc::clone(&tls_manager));
@@ -866,9 +687,7 @@ async fn test_readiness_probe_certificate_expiry() -> Result<()> {
     Ok(())
 }
 
-fn generate_expired_server_cert(
-    issuer: &Issuer<KeyPair>,
-) -> (rcgen::Certificate, KeyPair) {
+fn generate_expired_server_cert(issuer: &Issuer<KeyPair>) -> (rcgen::Certificate, KeyPair) {
     let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params
         .distinguished_name
@@ -877,7 +696,9 @@ fn generate_expired_server_cert(
         .extended_key_usages
         .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
     // Set validity to yesterday (expired)
-    let yesterday = OffsetDateTime::now_utc().checked_sub(Duration::new(86400, 0)).unwrap();
+    let yesterday = OffsetDateTime::now_utc()
+        .checked_sub(Duration::new(86400, 0))
+        .unwrap();
     params.not_before = yesterday.checked_sub(Duration::new(86400, 0)).unwrap(); // 2 days ago
     params.not_after = yesterday; // yesterday
     let key_pair = KeyPair::generate().unwrap();
@@ -887,107 +708,24 @@ fn generate_expired_server_cert(
 
 #[tokio::test]
 async fn test_proxy_http1_only() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .expect("Failed to install rustls crypto provider");
-
-    // Pick dynamic ports
-    let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
-
-    // Generate CA, server cert, and client cert
-    let (ca_cert, issuer) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&issuer);
-    let (client_cert, client_key) = generate_client_cert(&issuer);
-
-    // Write certs to temp dirs
-    let temp_dir = TempDir::new()?;
-    let cert_dir = temp_dir.path().join("certs");
-    let ca_dir = temp_dir.path().join("ca");
-    std::fs::create_dir(&cert_dir)?;
-    std::fs::create_dir(&ca_dir)?;
-
-    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
-    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
-
-    // Start mock upstream
-    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = upstream_listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let service = service_fn(|_req| async {
-                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
-                        "Hello from HTTP/1.1 upstream",
-                    ))))
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
-
-    // Start sidecar
-    let config = mtls_sidecar::config::Config {
-        tls_listen_port: sidecar_port,
-        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
-        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: cert_dir.to_str().unwrap().to_string(),
-        ca_dir: ca_dir.to_str().unwrap().to_string(),
-        inject_client_headers: false,
-        monitor_port: 8081,
-        enable_metrics: false,
-    };
-    let tls_manager = Arc::new(TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
-    let upstream_url = config.upstream_url.clone();
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = sidecar_listener.accept().await.unwrap();
-            let peer_addr = stream.peer_addr().ok();
-            let tls_manager = Arc::clone(&tls_manager);
-            let upstream = upstream_url.clone();
-            tokio::spawn(async move {
-                let current_config = tls_manager.config.read().await.clone();
-                let acceptor = TlsAcceptor::from(current_config);
-                let stream = acceptor.accept(stream).await.unwrap();
-                let (_, server_conn) = stream.get_ref();
-                let client_cert = server_conn
-                    .peer_certificates()
-                    .and_then(|certs| certs.first().cloned());
-                let service = service_fn(move |mut req| {
-                    if let Some(cert) = &client_cert {
-                        req.extensions_mut().insert(cert.clone());
-                    }
-                    let up = upstream.clone();
-                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    let addr = peer_addr;
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
-
-    // Wait a bit
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let setup = setup_basic_proxy_test(Bytes::from("Hello from HTTP/1.1 upstream"), false).await?;
 
     // Make HTTP/1.1-only request with client cert
     let client = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
+        .add_root_certificate(Certificate::from_pem(setup.ca_cert.pem().as_bytes())?)
         .identity(reqwest::Identity::from_pem(
-            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
+            format!(
+                "{}{}",
+                setup.client_cert.pem(),
+                setup.client_key.serialize_pem()
+            )
+            .as_bytes(),
         )?)
-        .http1_only()  // Force HTTP/1.1
+        .http1_only() // Force HTTP/1.1
         .build()?;
 
     let resp = client
-        .get(format!("https://localhost:{}/", sidecar_port))
+        .get(format!("https://localhost:{}/", setup.sidecar_port))
         .send()
         .await?;
     assert_eq!(resp.status(), 200);
@@ -999,106 +737,23 @@ async fn test_proxy_http1_only() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_http2_only() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .expect("Failed to install rustls crypto provider");
-
-    // Pick dynamic ports
-    let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
-
-    // Generate CA, server cert, and client cert
-    let (ca_cert, issuer) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&issuer);
-    let (client_cert, client_key) = generate_client_cert(&issuer);
-
-    // Write certs to temp dirs
-    let temp_dir = TempDir::new()?;
-    let cert_dir = temp_dir.path().join("certs");
-    let ca_dir = temp_dir.path().join("ca");
-    std::fs::create_dir(&cert_dir)?;
-    std::fs::create_dir(&ca_dir)?;
-
-    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
-    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
-
-    // Start mock upstream
-    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = upstream_listener.accept().await.unwrap();
-            tokio::spawn(async move {
-                let service = service_fn(|_req| async {
-                    Ok::<_, hyper::Error>(hyper::Response::new(Full::new(Bytes::from(
-                        "Hello from HTTP/2 upstream",
-                    ))))
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
-
-    // Start sidecar
-    let config = mtls_sidecar::config::Config {
-        tls_listen_port: sidecar_port,
-        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
-        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: cert_dir.to_str().unwrap().to_string(),
-        ca_dir: ca_dir.to_str().unwrap().to_string(),
-        inject_client_headers: false,
-        monitor_port: 8081,
-        enable_metrics: false,
-    };
-    let tls_manager = Arc::new(TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
-    let upstream_url = config.upstream_url.clone();
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = sidecar_listener.accept().await.unwrap();
-            let peer_addr = stream.peer_addr().ok();
-            let tls_manager = Arc::clone(&tls_manager);
-            let upstream = upstream_url.clone();
-            tokio::spawn(async move {
-                let current_config = tls_manager.config.read().await.clone();
-                let acceptor = TlsAcceptor::from(current_config);
-                let stream = acceptor.accept(stream).await.unwrap();
-                let (_, server_conn) = stream.get_ref();
-                let client_cert = server_conn
-                    .peer_certificates()
-                    .and_then(|certs| certs.first().cloned());
-                let service = service_fn(move |mut req| {
-                    if let Some(cert) = &client_cert {
-                        req.extensions_mut().insert(cert.clone());
-                    }
-                    let up = upstream.clone();
-                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    let addr = peer_addr;
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
-
-    // Wait a bit
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let setup = setup_basic_proxy_test(Bytes::from("Hello from HTTP/2 upstream"), false).await?;
 
     // Make HTTP/2-only request with client cert
     let client = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
+        .add_root_certificate(Certificate::from_pem(setup.ca_cert.pem().as_bytes())?)
         .identity(reqwest::Identity::from_pem(
-            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
+            format!(
+                "{}{}",
+                setup.client_cert.pem(),
+                setup.client_key.serialize_pem()
+            )
+            .as_bytes(),
         )?)
         .build()?;
 
     let resp = client
-        .get(format!("https://localhost:{}/", sidecar_port))
+        .get(format!("https://localhost:{}/", setup.sidecar_port))
         .send()
         .await?;
     assert_eq!(resp.status(), 200);
@@ -1110,28 +765,10 @@ async fn test_proxy_http2_only() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_grpc() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .expect("Failed to install rustls crypto provider");
-
     // Pick dynamic ports
-    let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
+    let (upstream_port, sidecar_port, monitor_port) = pick_ports();
 
-    // Generate CA, server cert, and client cert
-    let (ca_cert, issuer) = generate_ca();
-    let (server_cert, server_key) = generate_server_cert(&issuer);
-    let (client_cert, client_key) = generate_client_cert(&issuer);
-
-    // Write certs to temp dirs
-    let temp_dir = TempDir::new()?;
-    let cert_dir = temp_dir.path().join("certs");
-    let ca_dir = temp_dir.path().join("ca");
-    std::fs::create_dir(&cert_dir)?;
-    std::fs::create_dir(&ca_dir)?;
-
-    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
-    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
+    let (_temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key) = setup_certificates()?;
 
     // Start gRPC upstream server
     let greeter = MyGreeter::default();
@@ -1139,57 +776,28 @@ async fn test_proxy_grpc() -> Result<()> {
     let upstream_listener = TcpListener::bind(&upstream_addr).await?;
     tokio::spawn(async move {
         Server::builder()
-            .accept_http1(true)  // Allow HTTP/1.1 for gRPC
+            .accept_http1(true) // Allow HTTP/1.1 for gRPC
             .add_service(GreeterServer::new(greeter))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(upstream_listener))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                upstream_listener,
+            ))
             .await
             .unwrap();
     });
 
     // Start sidecar
-    let config = mtls_sidecar::config::Config {
-        tls_listen_port: sidecar_port,
-        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
-        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: cert_dir.to_str().unwrap().to_string(),
-        ca_dir: ca_dir.to_str().unwrap().to_string(),
-        inject_client_headers: false,
-        monitor_port: 8081,
-        enable_metrics: false,
-    };
+    let config = create_test_config(
+        upstream_port,
+        sidecar_port,
+        cert_dir.to_str().unwrap(),
+        ca_dir.to_str().unwrap(),
+        false,
+        monitor_port,
+    );
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
-    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
-    let upstream_url = config.upstream_url.clone();
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = sidecar_listener.accept().await.unwrap();
-            let peer_addr = stream.peer_addr().ok();
-            let tls_manager = Arc::clone(&tls_manager);
-            let upstream = upstream_url.clone();
-            tokio::spawn(async move {
-                let current_config = tls_manager.config.read().await.clone();
-                let acceptor = TlsAcceptor::from(current_config);
-                let stream = acceptor.accept(stream).await.unwrap();
-                let (_, server_conn) = stream.get_ref();
-                let client_cert = server_conn
-                    .peer_certificates()
-                    .and_then(|certs| certs.first().cloned());
-                let service = service_fn(move |mut req| {
-                    if let Some(cert) = &client_cert {
-                        req.extensions_mut().insert(cert.clone());
-                    }
-                    let up = upstream.clone();
-                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    let addr = peer_addr;
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
+
+    // Spawn server
+    start_sidecar(&config, Arc::clone(&tls_manager)).await?;
 
     // Wait a bit for servers to start
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -1199,23 +807,19 @@ async fn test_proxy_grpc() -> Result<()> {
 
     // For tonic with rustls, we need to use the rustls connector
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs = rustls_pemfile::certs(&mut ca_cert.pem().as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let ca_certs =
+        rustls_pemfile::certs(&mut ca_cert.pem().as_bytes()).collect::<Result<Vec<_>, _>>()?;
     root_store.add_parsable_certificates(ca_certs);
 
-    let client_certs = rustls_pemfile::certs(&mut client_cert.pem().as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    let client_certs =
+        rustls_pemfile::certs(&mut client_cert.pem().as_bytes()).collect::<Result<Vec<_>, _>>()?;
 
-    let client_key_der = rustls_pemfile::private_key(&mut client_key.serialize_pem().as_bytes())
-        .unwrap()
-        .unwrap();
+    let client_key_der =
+        rustls_pemfile::private_key(&mut client_key.serialize_pem().as_bytes())?.unwrap();
 
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
-        .with_client_auth_cert(client_certs, client_key_der)
-        .unwrap();
+        .with_client_auth_cert(client_certs, client_key_der)?;
 
     let http_connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
@@ -1234,7 +838,10 @@ async fn test_proxy_grpc() -> Result<()> {
     });
 
     let response = client.say_hello(request).await?;
-    assert_eq!(response.into_inner().message, "Hello gRPC Client from gRPC server!");
+    assert_eq!(
+        response.into_inner().message,
+        "Hello gRPC Client from gRPC server!"
+    );
 
     Ok(())
 }

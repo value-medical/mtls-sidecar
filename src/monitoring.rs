@@ -139,9 +139,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_live_handler() {
-        let _ = rustls::crypto::CryptoProvider::install_default(
-            rustls::crypto::ring::default_provider(),
-        );
         let dummy_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(DummyResolver));
@@ -170,9 +167,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_ready_handler_success() {
-        let _ = rustls::crypto::CryptoProvider::install_default(
-            rustls::crypto::ring::default_provider(),
-        );
         let dummy_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(DummyResolver));
@@ -208,9 +202,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_ready_handler_failure() {
-        let _ = rustls::crypto::CryptoProvider::install_default(
-            rustls::crypto::ring::default_provider(),
-        );
         let dummy_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(DummyResolver));
