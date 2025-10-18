@@ -47,7 +47,7 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
 
     std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
 
     // Start mock upstream
     let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
@@ -158,7 +158,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
 
     std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
 
     // Start mock upstream that echoes headers
     let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
@@ -342,7 +342,7 @@ async fn test_file_watching_reload() -> Result<()> {
 
     std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
 
     // Start mock upstream
     let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
@@ -442,7 +442,7 @@ async fn test_file_watching_reload() -> Result<()> {
     // Overwrite cert files to trigger reload
     std::fs::write(cert_dir.join("tls.crt"), new_server_cert.pem())?;
     std::fs::write(cert_dir.join("tls.key"), new_server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.pem"), new_ca_cert.pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.crt"), new_ca_cert.pem())?;
 
     // Manually trigger reload to ensure it works (file watching may not trigger in test env)
     reload_tls_manager
@@ -515,7 +515,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
 
     std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
 
     // Start mock upstream
     let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
@@ -640,7 +640,7 @@ async fn test_proxy_large_response() -> Result<()> {
 
     std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
 
     // Create large response body (10MB)
     let large_body = Bytes::from(vec![b'A'; 10_000_000]);
@@ -778,7 +778,7 @@ async fn test_readiness_probe_certificate_expiry() -> Result<()> {
 
     std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.pem"), ca_cert.pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
 
     // Start mock upstream that responds to readiness
     let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
