@@ -25,6 +25,9 @@ outbound connections.
 - Dedicated monitoring port for health probes (including server certificate expiry validation) and optional Prometheus metrics.
 - Supports both `kubernetes.io/tls` and VSO Opaque Secret formats via file auto-detection.
 - Supports HTTP/1.1 and HTTP/2 proxying, enabling mTLS termination for gRPC services.
+- Low overhead: <17MB RAM, <15.0% CPU at 1k req/s (avg 15.3MB RAM, peak 16.4MB RAM, avg 11.6% CPU, peak 14.1% CPU)
+- Graceful shutdown.
+- Structured JSON logging for requests, reloads, and errors.
 
 ## Non-Features
 
@@ -118,13 +121,6 @@ For minimal upstream examples, refer to the `examples/` directory.
 - **Spoofing Prevention**: The sidecar strips this header on inbound requests to prevent client tampering.
 
 This feature unburdens upstream services while exposing just enough cert info for auth/audit.
-
-## Performance and Security
-
-- Low overhead: <50MB RAM, <5% CPU at 1k req/s.
-- Graceful shutdown with 30s timeout.
-- Structured JSON logging for requests, reloads, and errors.
-- License: MIT.
 
 ## Building and Running
 
