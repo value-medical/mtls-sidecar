@@ -1,5 +1,10 @@
 # mtls-sidecar
 
+[![Tests](https://img.shields.io/github/actions/workflow/status/value-medical/mtls-sidecar/ci.yml?branch=main&label=Tests&logo=rust)](https://github.com/value-medical/mtls-sidecar/actions/workflows/ci.yml)
+[![Docker Build](https://img.shields.io/github/actions/workflow/status/value-medical/mtls-sidecar/docker.yml?branch=main&label=Docker%20Build&logo=docker)](https://github.com/value-medical/mtls-sidecar/actions/workflows/docker.yml)
+[![Docker Pulls](https://img.shields.io/docker/pulls/sebcvm/mtls-sidecar)](https://hub.docker.com/r/sebcvm/mtls-sidecar)
+[![Docker Image Size](https://img.shields.io/docker/image-size/sebcvm/mtls-sidecar/latest?logo=docker)](https://hub.docker.com/r/sebcvm/mtls-sidecar)
+
 A minimal Rust-based sidecar proxy for enforcing inbound mTLS in Kubernetes pods. It terminates mTLS connections,
 verifies client certificates against trusted CAs, and forwards validated HTTP requests to an upstream application in the
 same pod. The sidecar monitors mounted certificate files for updates (e.g., from Vault Secrets Operator) and reloads TLS
