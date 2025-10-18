@@ -279,7 +279,7 @@ fn generate_ca() -> (rcgen::Certificate, Issuer<'static, KeyPair>) {
     let (yesterday, tomorrow) = validity_period();
     params.not_before = yesterday;
     params.not_after = tomorrow;
-    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let key_pair = KeyPair::generate().unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
     let issuer = Issuer::new(params, key_pair);
     (cert, issuer)
@@ -298,7 +298,7 @@ fn generate_server_cert(
     let (yesterday, tomorrow) = validity_period();
     params.not_before = yesterday;
     params.not_after = tomorrow;
-    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let key_pair = KeyPair::generate().unwrap();
     let cert = params.signed_by(&key_pair, issuer).unwrap();
     (cert, key_pair)
 }
@@ -850,7 +850,7 @@ fn generate_expired_server_cert(
     let yesterday = OffsetDateTime::now_utc().checked_sub(Duration::new(86400, 0)).unwrap();
     params.not_before = yesterday.checked_sub(Duration::new(86400, 0)).unwrap(); // 2 days ago
     params.not_after = yesterday; // yesterday
-    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let key_pair = KeyPair::generate().unwrap();
     let cert = params.signed_by(&key_pair, issuer).unwrap();
     (cert, key_pair)
 }
