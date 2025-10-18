@@ -3,11 +3,11 @@ use axum;
 use base64;
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use portpicker;
 use rcgen::{CertificateParams, Issuer};
 use rcgen::DnType;
@@ -60,7 +60,7 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
                         "Hello from upstream",
                     ))))
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();
@@ -105,7 +105,7 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
                     let addr = peer_addr;
                     async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();
@@ -182,7 +182,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
                         Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("OK"))))
                     }
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();
@@ -229,7 +229,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
                     let addr = peer_addr;
                     async move { mtls_sidecar::proxy::handler(req, &up, inj, client, addr).await }
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();
@@ -353,7 +353,7 @@ async fn test_file_watching_reload() -> Result<()> {
                 let service = service_fn(|_req| async {
                     Ok::<_, hyper::Error>(hyper::Response::new(Full::new(Bytes::from("OK"))))
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();
@@ -411,7 +411,7 @@ async fn test_file_watching_reload() -> Result<()> {
                     let addr = peer_addr;
                     async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();
@@ -526,7 +526,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                 let service = service_fn(|_req| async {
                     Ok::<_, hyper::Error>(hyper::Response::new(Full::new(Bytes::from("OK"))))
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();
@@ -574,7 +574,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                     let addr = peer_addr;
                     async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();
@@ -657,7 +657,7 @@ async fn test_proxy_large_response() -> Result<()> {
                     let body = body.clone();
                     async move { Ok::<_, hyper::Error>(Response::new(Full::new(body))) }
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();
@@ -702,7 +702,7 @@ async fn test_proxy_large_response() -> Result<()> {
                     let addr = peer_addr;
                     async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();
@@ -793,7 +793,7 @@ async fn test_readiness_probe_certificate_expiry() -> Result<()> {
                         Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("Hello"))))
                     }
                 });
-                http1::Builder::new()
+                auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                     .unwrap();

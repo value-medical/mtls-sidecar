@@ -19,6 +19,7 @@ outbound connections.
 - Optional injection of client certificate details into upstream headers.
 - Dedicated monitoring port for health probes (including server certificate expiry validation) and optional Prometheus metrics.
 - Supports both `kubernetes.io/tls` and VSO Opaque Secret formats via file auto-detection.
+- Supports HTTP/1.1 and HTTP/2 proxying, enabling mTLS termination for gRPC services.
 
 ## Non-Features
 
