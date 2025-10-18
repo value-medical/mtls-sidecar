@@ -19,6 +19,31 @@ use time::Duration;
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
+
+// Define a simple gRPC service for testing
+pub mod hello_world {
+    tonic::include_proto!("helloworld");
+}
+
+use hello_world::greeter_server::{Greeter, GreeterServer};
+use hello_world::{HelloReply, HelloRequest};
+
+#[derive(Default)]
+pub struct MyGreeter {}
+
+#[tonic::async_trait]
+impl Greeter for MyGreeter {
+    async fn say_hello(
+        &self,
+        request: TonicRequest<HelloRequest>,
+    ) -> Result<TonicResponse<HelloReply>, Status> {
+        let reply = HelloReply {
+            message: format!("Hello {} from gRPC server!", request.into_inner().name),
+        };
+        Ok(TonicResponse::new(reply))
+    }
+}
 
 use mtls_sidecar::tls_manager::TlsManager;
 
@@ -54,7 +79,7 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
             let (stream, _) = upstream_listener.accept().await.unwrap();
             tokio::spawn(async move {
                 let service = service_fn(|_req| async {
-                    Ok::<_, hyper::Error>(hyper::Response::new(Full::new(Bytes::from(
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
                         "Hello from upstream",
                     ))))
                 });
@@ -349,7 +374,7 @@ async fn test_file_watching_reload() -> Result<()> {
             let (stream, _) = upstream_listener.accept().await.unwrap();
             tokio::spawn(async move {
                 let service = service_fn(|_req| async {
-                    Ok::<_, hyper::Error>(hyper::Response::new(Full::new(Bytes::from("OK"))))
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("OK"))))
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -522,7 +547,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
             let (stream, _) = upstream_listener.accept().await.unwrap();
             tokio::spawn(async move {
                 let service = service_fn(|_req| async {
-                    Ok::<_, hyper::Error>(hyper::Response::new(Full::new(Bytes::from("OK"))))
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("OK"))))
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -535,7 +560,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     // Start sidecar
     let config = mtls_sidecar::config::Config {
         tls_listen_port: sidecar_port,
-        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
+        upstream_url: format!("http://127.0.0.1:{}/grpc", upstream_port), // Add /grpc to identify gRPC test
         upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
         cert_dir: cert_dir.to_str().unwrap().to_string(),
         ca_dir: ca_dir.to_str().unwrap().to_string(),
@@ -568,7 +593,14 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                         req.extensions_mut().insert(cert.clone());
                     }
                     let up = upstream.clone();
-                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+                    // For gRPC test, use HTTP/2 capable client
+                    let client = if up.contains("grpc") {
+                        Arc::new(Client::builder(TokioExecutor::new()).build(
+                            hyper_util::client::legacy::connect::HttpConnector::new()
+                        ))
+                    } else {
+                        Arc::new(Client::builder(TokioExecutor::new()).build_http())
+                    };
                     let addr = peer_addr;
                     async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
                 });
@@ -851,6 +883,360 @@ fn generate_expired_server_cert(
     let key_pair = KeyPair::generate().unwrap();
     let cert = params.signed_by(&key_pair, issuer).unwrap();
     (cert, key_pair)
+}
+
+#[tokio::test]
+async fn test_proxy_http1_only() -> Result<()> {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Pick dynamic ports
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
+
+    // Generate CA, server cert, and client cert
+    let (ca_cert, issuer) = generate_ca();
+    let (server_cert, server_key) = generate_server_cert(&issuer);
+    let (client_cert, client_key) = generate_client_cert(&issuer);
+
+    // Write certs to temp dirs
+    let temp_dir = TempDir::new()?;
+    let cert_dir = temp_dir.path().join("certs");
+    let ca_dir = temp_dir.path().join("ca");
+    std::fs::create_dir(&cert_dir)?;
+    std::fs::create_dir(&ca_dir)?;
+
+    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
+    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
+
+    // Start mock upstream
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|_req| async {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
+                        "Hello from HTTP/1.1 upstream",
+                    ))))
+                });
+                auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // Start sidecar
+    let config = mtls_sidecar::config::Config {
+        tls_listen_port: sidecar_port,
+        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
+        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
+        cert_dir: cert_dir.to_str().unwrap().to_string(),
+        ca_dir: ca_dir.to_str().unwrap().to_string(),
+        inject_client_headers: false,
+        monitor_port: 8081,
+        enable_metrics: false,
+    };
+    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
+    let upstream_url = config.upstream_url.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = sidecar_listener.accept().await.unwrap();
+            let peer_addr = stream.peer_addr().ok();
+            let tls_manager = Arc::clone(&tls_manager);
+            let upstream = upstream_url.clone();
+            tokio::spawn(async move {
+                let current_config = tls_manager.config.read().await.clone();
+                let acceptor = TlsAcceptor::from(current_config);
+                let stream = acceptor.accept(stream).await.unwrap();
+                let (_, server_conn) = stream.get_ref();
+                let client_cert = server_conn
+                    .peer_certificates()
+                    .and_then(|certs| certs.first().cloned());
+                let service = service_fn(move |mut req| {
+                    if let Some(cert) = &client_cert {
+                        req.extensions_mut().insert(cert.clone());
+                    }
+                    let up = upstream.clone();
+                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+                    let addr = peer_addr;
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
+                });
+                auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // Wait a bit
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Make HTTP/1.1-only request with client cert
+    let client = reqwest::Client::builder()
+        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
+        .identity(reqwest::Identity::from_pem(
+            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
+        )?)
+        .http1_only()  // Force HTTP/1.1
+        .build()?;
+
+    let resp = client
+        .get(format!("https://localhost:{}/", sidecar_port))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await?;
+    assert_eq!(text, "Hello from HTTP/1.1 upstream");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_proxy_http2_only() -> Result<()> {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Pick dynamic ports
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
+
+    // Generate CA, server cert, and client cert
+    let (ca_cert, issuer) = generate_ca();
+    let (server_cert, server_key) = generate_server_cert(&issuer);
+    let (client_cert, client_key) = generate_client_cert(&issuer);
+
+    // Write certs to temp dirs
+    let temp_dir = TempDir::new()?;
+    let cert_dir = temp_dir.path().join("certs");
+    let ca_dir = temp_dir.path().join("ca");
+    std::fs::create_dir(&cert_dir)?;
+    std::fs::create_dir(&ca_dir)?;
+
+    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
+    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
+
+    // Start mock upstream
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port)).await?;
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|_req| async {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
+                        "Hello from HTTP/2 upstream",
+                    ))))
+                });
+                auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // Start sidecar
+    let config = mtls_sidecar::config::Config {
+        tls_listen_port: sidecar_port,
+        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
+        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
+        cert_dir: cert_dir.to_str().unwrap().to_string(),
+        ca_dir: ca_dir.to_str().unwrap().to_string(),
+        inject_client_headers: false,
+        monitor_port: 8081,
+        enable_metrics: false,
+    };
+    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
+    let upstream_url = config.upstream_url.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = sidecar_listener.accept().await.unwrap();
+            let peer_addr = stream.peer_addr().ok();
+            let tls_manager = Arc::clone(&tls_manager);
+            let upstream = upstream_url.clone();
+            tokio::spawn(async move {
+                let current_config = tls_manager.config.read().await.clone();
+                let acceptor = TlsAcceptor::from(current_config);
+                let stream = acceptor.accept(stream).await.unwrap();
+                let (_, server_conn) = stream.get_ref();
+                let client_cert = server_conn
+                    .peer_certificates()
+                    .and_then(|certs| certs.first().cloned());
+                let service = service_fn(move |mut req| {
+                    if let Some(cert) = &client_cert {
+                        req.extensions_mut().insert(cert.clone());
+                    }
+                    let up = upstream.clone();
+                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+                    let addr = peer_addr;
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
+                });
+                auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // Wait a bit
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Make HTTP/2-only request with client cert
+    let client = reqwest::Client::builder()
+        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
+        .identity(reqwest::Identity::from_pem(
+            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
+        )?)
+        .build()?;
+
+    let resp = client
+        .get(format!("https://localhost:{}/", sidecar_port))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await?;
+    assert_eq!(text, "Hello from HTTP/2 upstream");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_proxy_grpc() -> Result<()> {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    // Pick dynamic ports
+    let upstream_port = portpicker::pick_unused_port().expect("No free port");
+    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
+
+    // Generate CA, server cert, and client cert
+    let (ca_cert, issuer) = generate_ca();
+    let (server_cert, server_key) = generate_server_cert(&issuer);
+    let (client_cert, client_key) = generate_client_cert(&issuer);
+
+    // Write certs to temp dirs
+    let temp_dir = TempDir::new()?;
+    let cert_dir = temp_dir.path().join("certs");
+    let ca_dir = temp_dir.path().join("ca");
+    std::fs::create_dir(&cert_dir)?;
+    std::fs::create_dir(&ca_dir)?;
+
+    std::fs::write(cert_dir.join("tls.crt"), server_cert.pem())?;
+    std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
+    std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
+
+    // Start gRPC upstream server
+    let greeter = MyGreeter::default();
+    let upstream_addr = format!("127.0.0.1:{}", upstream_port);
+    let upstream_listener = TcpListener::bind(&upstream_addr).await?;
+    tokio::spawn(async move {
+        Server::builder()
+            .accept_http1(true)  // Allow HTTP/1.1 for gRPC
+            .add_service(GreeterServer::new(greeter))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(upstream_listener))
+            .await
+            .unwrap();
+    });
+
+    // Start sidecar
+    let config = mtls_sidecar::config::Config {
+        tls_listen_port: sidecar_port,
+        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
+        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
+        cert_dir: cert_dir.to_str().unwrap().to_string(),
+        ca_dir: ca_dir.to_str().unwrap().to_string(),
+        inject_client_headers: false,
+        monitor_port: 8081,
+        enable_metrics: false,
+    };
+    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+    let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
+    let upstream_url = config.upstream_url.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = sidecar_listener.accept().await.unwrap();
+            let peer_addr = stream.peer_addr().ok();
+            let tls_manager = Arc::clone(&tls_manager);
+            let upstream = upstream_url.clone();
+            tokio::spawn(async move {
+                let current_config = tls_manager.config.read().await.clone();
+                let acceptor = TlsAcceptor::from(current_config);
+                let stream = acceptor.accept(stream).await.unwrap();
+                let (_, server_conn) = stream.get_ref();
+                let client_cert = server_conn
+                    .peer_certificates()
+                    .and_then(|certs| certs.first().cloned());
+                let service = service_fn(move |mut req| {
+                    if let Some(cert) = &client_cert {
+                        req.extensions_mut().insert(cert.clone());
+                    }
+                    let up = upstream.clone();
+                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+                    let addr = peer_addr;
+                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
+                });
+                auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // Wait a bit for servers to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    // Create gRPC client that connects through the sidecar
+    let sidecar_addr = format!("https://localhost:{}", sidecar_port);
+
+    // For tonic with rustls, we need to use the rustls connector
+    let mut root_store = rustls::RootCertStore::empty();
+    let ca_certs = rustls_pemfile::certs(&mut ca_cert.pem().as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    root_store.add_parsable_certificates(ca_certs);
+
+    let client_certs = rustls_pemfile::certs(&mut client_cert.pem().as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let client_key_der = rustls_pemfile::private_key(&mut client_key.serialize_pem().as_bytes())
+        .unwrap()
+        .unwrap();
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(client_certs, client_key_der)
+        .unwrap();
+
+    let http_connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_only()
+        .enable_http1()
+        .build();
+
+    let channel = tonic::transport::Endpoint::new(sidecar_addr)?
+        .connect_with_connector(http_connector)
+        .await?;
+
+    let mut client = hello_world::greeter_client::GreeterClient::new(channel);
+
+    let request = tonic::Request::new(HelloRequest {
+        name: "gRPC Client".into(),
+    });
+
+    let response = client.say_hello(request).await?;
+    assert_eq!(response.into_inner().message, "Hello gRPC Client from gRPC server!");
+
+    Ok(())
 }
 
 fn validity_period() -> (OffsetDateTime, OffsetDateTime) {
