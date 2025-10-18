@@ -49,8 +49,8 @@ use mtls_sidecar::tls_manager::TlsManager;
 
 #[tokio::test]
 async fn test_proxy_with_valid_cert() -> Result<()> {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .expect("Failed to install rustls crypto provider");
 
     // Pick dynamic ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
@@ -160,8 +160,8 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_with_header_injection() -> Result<()> {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .expect("Failed to install rustls crypto provider");
 
     // Pick dynamic ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
@@ -344,8 +344,8 @@ fn generate_client_cert(
 
 #[tokio::test]
 async fn test_file_watching_reload() -> Result<()> {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .expect("Failed to install rustls crypto provider");
 
     // Pick dynamic ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
@@ -518,8 +518,8 @@ async fn test_file_watching_reload() -> Result<()> {
 
 #[tokio::test]
 async fn test_tls_handshake_failure_handling() -> Result<()> {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .expect("Failed to install rustls crypto provider");
 
     // Pick dynamic ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
@@ -649,8 +649,8 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_large_response() -> Result<()> {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .expect("Failed to install rustls crypto provider");
 
     // Pick dynamic ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
@@ -787,8 +787,8 @@ async fn test_invalid_config_exits() -> Result<()> {
 
 #[tokio::test]
 async fn test_readiness_probe_certificate_expiry() -> Result<()> {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .expect("Failed to install rustls crypto provider");
 
     // Pick dynamic ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
@@ -887,8 +887,8 @@ fn generate_expired_server_cert(
 
 #[tokio::test]
 async fn test_proxy_http1_only() -> Result<()> {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .expect("Failed to install rustls crypto provider");
 
     // Pick dynamic ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
@@ -999,8 +999,8 @@ async fn test_proxy_http1_only() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_http2_only() -> Result<()> {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .expect("Failed to install rustls crypto provider");
 
     // Pick dynamic ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
@@ -1029,7 +1029,7 @@ async fn test_proxy_http2_only() -> Result<()> {
             let (stream, _) = upstream_listener.accept().await.unwrap();
             tokio::spawn(async move {
                 let service = service_fn(|_req| async {
-                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
+                    Ok::<_, hyper::Error>(hyper::Response::new(Full::new(Bytes::from(
                         "Hello from HTTP/2 upstream",
                     ))))
                 });
@@ -1110,8 +1110,8 @@ async fn test_proxy_http2_only() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_grpc() -> Result<()> {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .expect("Failed to install rustls crypto provider");
 
     // Pick dynamic ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
