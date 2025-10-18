@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
                                 async move { proxy::handler(req, &up, inj, cli, peer_addr).await }
                             });
 
-                            if let Err(err) = http1::Builder::new()
+                            if let Err(err) = auto::Builder::new(TokioExecutor::new())
                                 .serve_connection(TokioIo::new(stream), service)
                                 .await
                             {
