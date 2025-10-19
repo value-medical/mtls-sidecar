@@ -48,22 +48,26 @@ impl Greeter for MyGreeter {
 
 use mtls_sidecar::tls_manager::TlsManager;
 
+struct TestCerts {
+    _temp_dir: TempDir,
+    cert_dir: std::path::PathBuf,
+    ca_dir: std::path::PathBuf,
+    ca_cert: rcgen::Certificate,
+    client_cert: rcgen::Certificate,
+    client_key: KeyPair,
+}
+
 struct TestSetup {
     sidecar_port: u16,
+    upstream_port: u16,
+    monitor_port: u16,
     client: reqwest::Client,
     ca_cert: rcgen::Certificate,
     client_cert: rcgen::Certificate,
     client_key: KeyPair,
 }
 
-fn setup_certificates() -> Result<(
-    TempDir,
-    std::path::PathBuf,
-    std::path::PathBuf,
-    rcgen::Certificate,
-    rcgen::Certificate,
-    KeyPair,
-)> {
+fn setup_certificates() -> Result<TestCerts> {
     // Generate CA, server cert, and client cert
     let (ca_cert, issuer) = generate_ca();
     let (server_cert, server_key) = generate_server_cert(&issuer);
@@ -80,7 +84,14 @@ fn setup_certificates() -> Result<(
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
     std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
 
-    Ok((temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key))
+    Ok(TestCerts {
+        _temp_dir: temp_dir,
+        cert_dir,
+        ca_dir,
+        ca_cert,
+        client_cert,
+        client_key,
+    })
 }
 fn generate_ca() -> (rcgen::Certificate, Issuer<'static, KeyPair>) {
     let mut params = CertificateParams::new(vec![]).unwrap();
@@ -130,17 +141,16 @@ fn generate_client_cert(issuer: &Issuer<KeyPair>) -> (rcgen::Certificate, KeyPai
 fn create_test_config(
     upstream_port: u16,
     sidecar_port: u16,
-    cert_dir: &str,
-    ca_dir: &str,
-    inject_client_headers: bool,
     monitor_port: u16,
+    test_certs: &TestCerts,
+    inject_client_headers: bool,
 ) -> mtls_sidecar::config::Config {
     mtls_sidecar::config::Config {
         tls_listen_port: sidecar_port,
         upstream_url: format!("http://127.0.0.1:{}", upstream_port),
         upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: cert_dir.to_string(),
-        ca_dir: ca_dir.to_string(),
+        cert_dir: test_certs.cert_dir.to_str().unwrap().to_owned(),
+        ca_dir: test_certs.ca_dir.to_str().unwrap().to_owned(),
         inject_client_headers,
         monitor_port,
         enable_metrics: false,
@@ -155,34 +165,29 @@ fn pick_ports() -> (u16, u16, u16) {
 }
 
 async fn setup_test(
-    upstream_port: u16,
-    cert_dir: &str,
-    ca_dir: &str,
-    ca_cert: &rcgen::Certificate,
-    client_cert: &rcgen::Certificate,
-    client_key: KeyPair,
+    test_certs: TestCerts,
     inject_headers: bool,
-    monitor_port: u16,
 ) -> Result<(TestSetup, Arc<TlsManager>, mtls_sidecar::config::Config)> {
-    let sidecar_port = portpicker::pick_unused_port().expect("No free port");
+    let (upstream_port, sidecar_port, monitor_port) = pick_ports();
     let config = create_test_config(
         upstream_port,
         sidecar_port,
-        cert_dir,
-        ca_dir,
-        inject_headers,
         monitor_port,
+        &test_certs,
+        inject_headers,
     );
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
     start_sidecar(&config, Arc::clone(&tls_manager)).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    let client = create_client_builder_with_cert(ca_cert, client_cert, &client_key)?.build()?;
+    let client = create_client_builder_with_cert(&test_certs)?.build()?;
     let setup = TestSetup {
         sidecar_port,
+        upstream_port,
+        monitor_port,
         client,
-        ca_cert: ca_cert.clone(),
-        client_cert: client_cert.clone(),
-        client_key,
+        ca_cert: test_certs.ca_cert.clone(),
+        client_cert: test_certs.client_cert.clone(),
+        client_key: test_certs.client_key,
     };
     Ok((setup, tls_manager, config))
 }
@@ -191,20 +196,9 @@ async fn setup_basic_proxy_test(
     upstream_response: Bytes,
     inject_headers: bool,
 ) -> Result<TestSetup> {
-    let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let monitor_port = portpicker::pick_unused_port().expect("No free port");
-    let (_temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key) = setup_certificates()?;
-    start_basic_upstream(upstream_port, upstream_response).await?;
-    let (setup, _, _) = setup_test(
-        upstream_port,
-        cert_dir.to_str().unwrap(),
-        ca_dir.to_str().unwrap(),
-        &ca_cert,
-        &client_cert,
-        client_key,
-        inject_headers,
-        monitor_port,
-    ).await?;
+    let test_certs = setup_certificates()?;
+    let (setup, _, _) = setup_test(test_certs, inject_headers).await?;
+    start_basic_upstream(setup.upstream_port, upstream_response).await?;
     Ok(setup)
 }
 
@@ -326,15 +320,16 @@ async fn start_sidecar(
     Ok(())
 }
 
-fn create_client_builder_with_cert(
-    ca_cert: &rcgen::Certificate,
-    client_cert: &rcgen::Certificate,
-    client_key: &KeyPair,
-) -> Result<reqwest::ClientBuilder> {
+fn create_client_builder_with_cert(test_certs: &TestCerts) -> Result<reqwest::ClientBuilder> {
     let builder = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
+        .add_root_certificate(Certificate::from_pem(test_certs.ca_cert.pem().as_bytes())?)
         .identity(reqwest::Identity::from_pem(
-            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).as_bytes(),
+            format!(
+                "{}{}",
+                test_certs.client_cert.pem(),
+                test_certs.client_key.serialize_pem()
+            )
+            .as_bytes(),
         )?);
     Ok(builder)
 }
@@ -357,23 +352,10 @@ async fn test_proxy_with_valid_cert() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_with_header_injection() -> Result<()> {
-    let upstream_port = portpicker::pick_unused_port().expect("No free port");
-    let monitor_port = portpicker::pick_unused_port().expect("No free port");
+    let test_certs = setup_certificates()?;
+    let (setup, _, _) = setup_test(test_certs, true).await?;
 
-    let (_temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key) = setup_certificates()?;
-
-    let received_headers = start_header_echo_upstream(upstream_port).await?;
-
-    let (setup, _, _) = setup_test(
-        upstream_port,
-        cert_dir.to_str().unwrap(),
-        ca_dir.to_str().unwrap(),
-        &ca_cert,
-        &client_cert,
-        client_key,
-        true,
-        monitor_port,
-    ).await?;
+    let received_headers = start_header_echo_upstream(setup.upstream_port).await?;
 
     let resp = setup
         .client
@@ -390,8 +372,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
         .find(|h| h.starts_with("x-client-tls-info:"))
         .unwrap();
     let b64_value = tls_info_header.strip_prefix("x-client-tls-info: ").unwrap();
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(b64_value)?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64_value)?;
     let json_str = String::from_utf8(decoded).unwrap();
     let info: Value = serde_json::from_str(&json_str).unwrap();
     assert_eq!(info["subject"], "CN=client");
@@ -409,7 +390,7 @@ async fn test_proxy_with_header_injection() -> Result<()> {
 async fn test_file_watching_reload() -> Result<()> {
     let (upstream_port, sidecar_port, monitor_port) = pick_ports();
 
-    let (_temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key) = setup_certificates()?;
+    let mut test_certs = setup_certificates()?;
 
     // Start mock upstream
     start_basic_upstream(upstream_port, Bytes::from("OK")).await?;
@@ -418,12 +399,11 @@ async fn test_file_watching_reload() -> Result<()> {
     let config = create_test_config(
         upstream_port,
         sidecar_port,
-        cert_dir.to_str().unwrap(),
-        ca_dir.to_str().unwrap(),
-        false,
         monitor_port,
+        &test_certs,
+        false,
     );
-    let tls_manager = Arc::new(mtls_sidecar::tls_manager::TlsManager::new(&config).await?);
+    let tls_manager = Arc::new(TlsManager::new(&config).await?);
     let watcher_tls_manager = Arc::clone(&tls_manager);
     let reload_tls_manager = Arc::clone(&tls_manager);
     let cert_dir_clone = config.cert_dir.clone();
@@ -443,8 +423,7 @@ async fn test_file_watching_reload() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Make initial request with old client cert
-    let old_client =
-        create_client_builder_with_cert(&ca_cert, &client_cert, &client_key)?.build()?;
+    let old_client = create_client_builder_with_cert(&test_certs)?.build()?;
     let resp = old_client
         .get(format!("https://localhost:{}/", sidecar_port))
         .send()
@@ -456,22 +435,24 @@ async fn test_file_watching_reload() -> Result<()> {
     let (new_server_cert, new_server_key) = generate_server_cert(&issuer);
 
     // Overwrite cert files to trigger reload
-    std::fs::write(cert_dir.join("tls.crt"), new_server_cert.pem())?;
-    std::fs::write(cert_dir.join("tls.key"), new_server_key.serialize_pem())?;
-    std::fs::write(ca_dir.join("ca-bundle.crt"), new_ca_cert.pem())?;
+    std::fs::write(test_certs.cert_dir.join("tls.crt"), new_server_cert.pem())?;
+    std::fs::write(
+        test_certs.cert_dir.join("tls.key"),
+        new_server_key.serialize_pem(),
+    )?;
+    std::fs::write(test_certs.ca_dir.join("ca-bundle.crt"), new_ca_cert.pem())?;
 
     // Manually trigger reload to ensure it works (file watching may not trigger in test env)
     reload_tls_manager
         .reload(&config.cert_dir, &config.ca_dir)
-        .await
-        .unwrap();
+        .await?;
 
     // Wait a bit
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Try old client again - should fail because server now requires client cert verified by new CA
-    let old_client_permissive =
-        create_client_builder_with_cert(&new_ca_cert, &client_cert, &client_key)?.build()?;
+    test_certs.ca_cert = new_ca_cert;
+    let old_client_permissive = create_client_builder_with_cert(&test_certs)?.build()?;
     let result = old_client_permissive
         .get(format!("https://localhost:{}/", sidecar_port))
         .send()
@@ -483,10 +464,10 @@ async fn test_file_watching_reload() -> Result<()> {
 
     // Generate new client cert signed by new CA
     let (new_client_cert, new_client_key) = generate_client_cert(&issuer);
+    test_certs.client_cert = new_client_cert;
+    test_certs.client_key = new_client_key;
 
-    let new_client =
-        create_client_builder_with_cert(&new_ca_cert, &new_client_cert, &new_client_key)?
-            .build()?;
+    let new_client = create_client_builder_with_cert(&test_certs)?.build()?;
 
     let resp = new_client
         .get(format!("https://localhost:{}/", sidecar_port))
@@ -501,7 +482,7 @@ async fn test_file_watching_reload() -> Result<()> {
 async fn test_tls_handshake_failure_handling() -> Result<()> {
     let (upstream_port, sidecar_port, monitor_port) = pick_ports();
 
-    let (_temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key) = setup_certificates()?;
+    let test_certs = setup_certificates()?;
 
     // Start mock upstream
     start_basic_upstream(upstream_port, Bytes::from("OK")).await?;
@@ -510,10 +491,9 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     let mut config = create_test_config(
         upstream_port,
         sidecar_port,
-        cert_dir.to_str().unwrap(),
-        ca_dir.to_str().unwrap(),
-        false,
         monitor_port,
+        &test_certs,
+        false,
     );
     config.upstream_url = format!("http://127.0.0.1:{}/grpc", upstream_port);
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
@@ -566,7 +546,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
 
     // Try invalid connection (no client cert)
     let invalid_client = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(ca_cert.pem().as_bytes())?)
+        .add_root_certificate(Certificate::from_pem(test_certs.ca_cert.pem().as_bytes())?)
         .build()?;
     let result = invalid_client
         .get(format!("https://localhost:{}/", sidecar_port))
@@ -578,8 +558,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
     );
 
     // Now try valid connection
-    let valid_client =
-        create_client_builder_with_cert(&ca_cert, &client_cert, &client_key)?.build()?;
+    let valid_client = create_client_builder_with_cert(&test_certs)?.build()?;
     let resp = valid_client
         .get(format!("https://localhost:{}/", sidecar_port))
         .send()
@@ -652,18 +631,18 @@ async fn test_readiness_probe_certificate_expiry() -> Result<()> {
     std::fs::write(cert_dir.join("tls.key"), server_key.serialize_pem())?;
     std::fs::write(ca_dir.join("ca-bundle.crt"), ca_cert.pem())?;
 
-    start_readiness_upstream(upstream_port).await?;
-
-    let (_setup, tls_manager, config) = setup_test(
-        upstream_port,
-        cert_dir.to_str().unwrap(),
-        ca_dir.to_str().unwrap(),
-        &ca_cert,
-        &client_cert,
+    let test_certs = TestCerts {
+        _temp_dir: temp_dir,
+        cert_dir,
+        ca_dir,
+        ca_cert,
+        client_cert,
         client_key,
-        false,
-        monitor_port,
-    ).await?;
+    };
+
+    let (_setup, tls_manager, config) = setup_test(test_certs, false).await?;
+
+    start_readiness_upstream(upstream_port).await?;
 
     // Start monitoring server
     let router = mtls_sidecar::monitoring::create_router(&config, Arc::clone(&tls_manager));
@@ -768,7 +747,7 @@ async fn test_proxy_grpc() -> Result<()> {
     // Pick dynamic ports
     let (upstream_port, sidecar_port, monitor_port) = pick_ports();
 
-    let (_temp_dir, cert_dir, ca_dir, ca_cert, client_cert, client_key) = setup_certificates()?;
+    let test_certs = setup_certificates()?;
 
     // Start gRPC upstream server
     let greeter = MyGreeter::default();
@@ -789,10 +768,9 @@ async fn test_proxy_grpc() -> Result<()> {
     let config = create_test_config(
         upstream_port,
         sidecar_port,
-        cert_dir.to_str().unwrap(),
-        ca_dir.to_str().unwrap(),
-        false,
         monitor_port,
+        &test_certs,
+        false,
     );
     let tls_manager = Arc::new(TlsManager::new(&config).await?);
 
@@ -807,15 +785,16 @@ async fn test_proxy_grpc() -> Result<()> {
 
     // For tonic with rustls, we need to use the rustls connector
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_certs =
-        rustls_pemfile::certs(&mut ca_cert.pem().as_bytes()).collect::<Result<Vec<_>, _>>()?;
+    let ca_certs = rustls_pemfile::certs(&mut test_certs.ca_cert.pem().as_bytes())
+        .collect::<Result<Vec<_>, _>>()?;
     root_store.add_parsable_certificates(ca_certs);
 
-    let client_certs =
-        rustls_pemfile::certs(&mut client_cert.pem().as_bytes()).collect::<Result<Vec<_>, _>>()?;
+    let client_certs = rustls_pemfile::certs(&mut test_certs.client_cert.pem().as_bytes())
+        .collect::<Result<Vec<_>, _>>()?;
 
     let client_key_der =
-        rustls_pemfile::private_key(&mut client_key.serialize_pem().as_bytes())?.unwrap();
+        rustls_pemfile::private_key(&mut test_certs.client_key.serialize_pem().as_bytes())?
+            .unwrap();
 
     let tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
