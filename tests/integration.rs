@@ -316,7 +316,7 @@ async fn start_sidecar(
                     let up = upstream.clone();
                     let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
                     let addr = peer_addr;
-                    async move { mtls_sidecar::proxy::handler(req, &up, inject, client, addr).await }
+                    async move { mtls_sidecar::proxy_inbound::handler(req, &up, inject, client, addr).await }
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -538,7 +538,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                         Arc::new(Client::builder(TokioExecutor::new()).build_http())
                     };
                     let addr = peer_addr;
-                    async move { mtls_sidecar::proxy::handler(req, &up, false, client, addr).await }
+                    async move { mtls_sidecar::proxy_inbound::handler(req, &up, false, client, addr).await }
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)

@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 
-use mtls_sidecar::{config, monitoring, proxy, tls_manager, watcher};
+use mtls_sidecar::{config, monitoring, proxy_inbound, tls_manager, watcher};
 
 use tls_manager::TlsManager;
 
@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
                                 let up = upstream.clone();
                                 let inj = inject;
                                 let cli = Arc::clone(&client);
-                                async move { proxy::handler(req, &up, inj, cli, peer_addr).await }
+                                async move { proxy_inbound::handler(req, &up, inj, cli, peer_addr).await }
                             });
 
                             if let Err(err) = auto::Builder::new(TokioExecutor::new())
