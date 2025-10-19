@@ -168,8 +168,9 @@ impl TlsManager {
         Ok(ca_certs)
     }
 
-    async fn load_server_cert_and_key(
+    async fn load_cert_and_key(
         cert_dir: &PathBuf,
+        entity_type: &str,
     ) -> Result<
         Option<(
             Vec<rustls::pki_types::CertificateDer<'static>>,
@@ -182,35 +183,52 @@ impl TlsManager {
             .or_else(|| Self::find_cert_key(&cert_dir, "certificate", "private_key"))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "No valid cert/key pair found in {}",
+                    "No valid cert/key pair found for {} in {}",
+                    entity_type,
                     cert_dir.to_string_lossy()
                 )
             })?;
 
         // Log the paths being used
-        tracing::info!("Using certificate: {}", cert_path.to_string_lossy());
-        tracing::info!("Using private key: {}", key_path.to_string_lossy());
+        tracing::info!("Using {} certificate: {}", entity_type, cert_path.to_string_lossy());
+        tracing::info!("Using {} private key: {}", entity_type, key_path.to_string_lossy());
 
         // Read certificate
         let cert_pem = fs::read(&cert_path).await.with_context(|| {
             format!(
-                "Failed to read server certificate from {}",
+                "Failed to read {} certificate from {}",
+                entity_type,
                 cert_path.to_string_lossy()
             )
         })?;
         let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
             .collect::<Result<Vec<_>, _>>()
-            .context("Failed to parse server certificate")?;
+            .with_context(|| format!("Failed to parse {} certificate", entity_type))?;
 
         // Read private key
-        let key_pem = fs::read(&key_path).await.context(format!(
-            "Failed to read private key from {}",
-            key_path.to_string_lossy()
-        ))?;
+        let key_pem = fs::read(&key_path).await.with_context(|| {
+            format!(
+                "Failed to read {} private key from {}",
+                entity_type,
+                key_path.to_string_lossy()
+            )
+        })?;
         let key = PrivateKeyDer::from_pem_slice(key_pem.as_slice())
-            .context("Failed to parse private key from PEM")?;
+            .with_context(|| format!("Failed to parse {} private key from PEM", entity_type))?;
 
         Ok(Some((certs, key)))
+    }
+
+    async fn load_server_cert_and_key(
+        cert_dir: &PathBuf,
+    ) -> Result<
+        Option<(
+            Vec<rustls::pki_types::CertificateDer<'static>>,
+            PrivateKeyDer<'static>,
+        )>,
+        Error,
+    > {
+        Self::load_cert_and_key(cert_dir, "server").await
     }
 
     async fn load_client_cert_and_key(
@@ -222,38 +240,7 @@ impl TlsManager {
         )>,
         Error,
     > {
-        // Auto-detect cert and key files
-        let (cert_path, key_path) = Self::find_cert_key(&cert_dir, "tls.crt", "tls.key")
-            .or_else(|| Self::find_cert_key(&cert_dir, "certificate", "private_key"))
-            .ok_or_else(|| {
-                DomainError::Other(format!(
-                    "No valid cert/key pair found in {}",
-                    cert_dir.to_string_lossy()
-                ))
-            })?;
-
-        // Log the paths being used
-        tracing::info!("Using client certificate: {}", cert_path.to_string_lossy());
-        tracing::info!("Using client private key: {}", key_path.to_string_lossy());
-
-        // Read certificate
-        let cert_pem = fs::read(&cert_path).await.context(format!(
-            "Failed to read client certificate from {}",
-            cert_path.to_string_lossy()
-        ))?;
-        let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
-            .collect::<Result<Vec<_>, _>>()
-            .context("Failed to parse client certificate")?;
-
-        // Read private key
-        let key_pem = fs::read(&key_path).await.context(format!(
-            "Failed to read client private key from {}",
-            key_path.to_string_lossy()
-        ))?;
-        let key = PrivateKeyDer::from_pem_slice(key_pem.as_slice())
-            .context("Failed to parse client private key from PEM")?;
-
-        Ok(Some((certs, key)))
+        Self::load_cert_and_key(cert_dir, "client").await
     }
 
     fn find_cert_key(dir: &PathBuf, cert_name: &str, key_name: &str) -> Option<(PathBuf, PathBuf)> {
