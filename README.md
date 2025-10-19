@@ -22,6 +22,7 @@ outbound connections.
 - Hot-reloads TLS configuration on file changes.
 - Simple reverse proxy to a single upstream endpoint.
 - Optional injection of client certificate details into upstream headers.
+- Outbound mTLS forward proxy: Accepts HTTP requests on a separate localhost port and forwards them as HTTPS connections authenticated with client certificates, verifying server identity against the CA bundle.
 - Dedicated monitoring port for health probes (including server certificate expiry validation) and optional Prometheus metrics.
 - Supports both `kubernetes.io/tls` and VSO Opaque Secret formats via file auto-detection.
 - Supports HTTP/1.1 and HTTP/2 proxying, enabling mTLS termination for gRPC services.
@@ -46,9 +47,11 @@ unless noted.
 | `TLS_LISTEN_PORT`        | `8443`                        | TCP port for inbound mTLS listener.                          |
 | `UPSTREAM_URL`           | `http://localhost:8080`       | Full URL for the proxy target.                               |
 | `UPSTREAM_READINESS_URL` | `http://localhost:8080/ready` | URL for upstream readiness check.                            |
-| `CERT_DIR`               | `/etc/certs`                  | Directory containing server cert/key files.                  |
+| `SERVER_CERT_DIR`        | `/etc/certs`                  | Directory containing server cert/key files.                  |
 | `CA_DIR`                 | `/etc/ca`                     | Directory containing the CA bundle file.                     |
 | `INJECT_CLIENT_HEADERS`  | `false`                       | If `true`, inject `X-Client-TLS-Info` header.                |
+| `OUTBOUND_PROXY_PORT`    | ``                            | TCP port for outbound mTLS proxy listener (empty disables). |
+| `CLIENT_CERT_DIR`        | `/etc/client-certs`           | Directory containing client certificate files.               |
 | `MONITOR_PORT`           | `8081`                        | Port for health probes and metrics.                          |
 | `ENABLE_METRICS`         | `false`                       | If `true`, expose Prometheus `/metrics` on the monitor port. |
 
@@ -65,8 +68,9 @@ unless noted.
 
 Mount entire Secrets to directories; the sidecar auto-detects files:
 
-- Server cert: Prefers `tls.crt` + `tls.key`  in `CERT_DIR`; falls back to `certificate` + `private_key`.
-- CA bundle: Prefers `ca-bundle.pem` or `ca.crt` in `CA_DIR`; merges `ca.crt` or `issuing_ca` if found in `CERT_DIR`.
+- Server cert: Prefers `tls.crt` + `tls.key`  in `SERVER_CERT_DIR`; falls back to `certificate` + `private_key`.
+- Client cert: Prefers `tls.crt` + `tls.key` in `CLIENT_CERT_DIR`; falls back to `certificate` + `private_key`.
+- CA bundle: Prefers `ca-bundle.pem` or `ca.crt` in `CA_DIR`; merges `ca.crt` or `issuing_ca` if found in `SERVER_CERT_DIR` or `CLIENT_CERT_DIR`.
 - Ignores unused keys (e.g., `_raw`, `expiration`).
 
 On load/reload failure, logs an error and retains the previous configuration.

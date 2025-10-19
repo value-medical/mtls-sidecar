@@ -28,13 +28,12 @@ lazy_static! {
         register_int_counter!("requests_total", "Total number of proxied requests").unwrap();
 }
 
-pub fn create_router(config: &Config, tls_manager: Arc<TlsManager>) -> Router {
+pub fn create_router(config: Arc<Config>, tls_manager: Arc<TlsManager>) -> Router {
     let readiness_url = config.upstream_readiness_url.clone();
-    let tls_manager_clone = Arc::clone(&tls_manager);
 
     let mut router = Router::new().route("/live", get(live_handler)).route(
         "/ready",
-        get(move |req| ready_handler(req, readiness_url.clone(), Arc::clone(&tls_manager_clone))),
+        get(move |req| ready_handler(req, readiness_url.clone(), Arc::clone(&tls_manager))),
     );
 
     if config.enable_metrics {
@@ -51,17 +50,12 @@ async fn live_handler() -> &'static str {
 }
 
 async fn check_certificate_expiry(tls_manager: &TlsManager) -> Result<(), ()> {
-    let earliest_expiry = *tls_manager.earliest_expiry.read().await;
-
-    if let Some(expiry) = earliest_expiry {
+    if let Some(earliest_expiry) = *tls_manager.earliest_expiry.read().await {
         let now = Utc::now();
-        if now > expiry {
-            tracing::error!("Certificate expired: earliest expiry={}", expiry);
+        if now > earliest_expiry {
+            tracing::error!("Certificate expired: earliest expiry={}", earliest_expiry);
             return Err(());
         }
-    } else {
-        // No certificates loaded, assume OK (for tests or minimal setups)
-        return Ok(());
     }
 
     Ok(())
@@ -118,11 +112,11 @@ mod tests {
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
-    use rustls::ServerConfig;
+    use rustls::{ClientConfig, ServerConfig};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::spawn;
-    use tokio::sync::RwLock;
     use {Request, StatusCode};
 
     #[derive(Debug)]
@@ -139,25 +133,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_live_handler() {
-        let dummy_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(DummyResolver));
-        let tls_manager = Arc::new(TlsManager {
-            config: Arc::new(RwLock::new(Arc::new(dummy_config))),
-            earliest_expiry: Arc::new(RwLock::new(None)),
-        });
+        let tls_manager = TlsManager::new();
+        tls_manager
+            .set_server_config(Some(Arc::new(
+                ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(DummyResolver)),
+            )))
+            .await;
         let _router = create_router(
-            &Config {
-                tls_listen_port: 8443,
+            Arc::new(Config {
+                tls_listen_port: Some(8443),
                 upstream_url: "http://localhost:8080".to_string(),
                 upstream_readiness_url: "http://localhost:8080/ready".to_string(),
-                cert_dir: "/etc/certs".to_string(),
-                ca_dir: "/etc/ca".to_string(),
+                ca_dir: Some(PathBuf::from("/etc/ca")),
+                server_cert_dir: Some(PathBuf::from("/etc/certs")),
+                client_cert_dir: Some(PathBuf::from("/etc/client-certs")),
                 inject_client_headers: false,
+                outbound_proxy_port: None,
                 monitor_port: 8081,
                 enable_metrics: false,
-            },
-            tls_manager,
+            }),
+            Arc::new(tls_manager),
         );
 
         // For unit test, perhaps use axum-test or something, but since no extra deps, maybe skip or mock.
@@ -167,16 +164,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_ready_handler_success() {
-        let dummy_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(DummyResolver));
-        let tls_manager = Arc::new(TlsManager {
-            config: Arc::new(RwLock::new(Arc::new(dummy_config))),
-            earliest_expiry: Arc::new(RwLock::new(None)),
-        });
+        let tls_manager = Arc::new(TlsManager::new());
+        tls_manager
+            .set_server_config(Some(Arc::new(
+                ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(DummyResolver)),
+            )))
+            .await;
 
         // Start mock upstream
-        let listener = TcpListener::bind("127.0.0.1:8083").await.unwrap();
+        let upstream_port = portpicker::pick_unused_port().expect("No free port");
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", upstream_port))
+            .await
+            .unwrap();
         spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -195,20 +196,32 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let req = Request::get("/ready").body(Body::empty()).unwrap();
-        let result =
-            ready_handler(req, "http://127.0.0.1:8083/ready".to_string(), tls_manager).await;
+        let result = ready_handler(
+            req,
+            format!("http://127.0.0.1:{}/ready", upstream_port).to_string(),
+            tls_manager,
+        )
+        .await;
         assert_eq!(result, Ok("OK"));
     }
 
     #[tokio::test]
     async fn test_ready_handler_failure() {
-        let dummy_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(DummyResolver));
-        let tls_manager = Arc::new(TlsManager {
-            config: Arc::new(RwLock::new(Arc::new(dummy_config))),
-            earliest_expiry: Arc::new(RwLock::new(None)),
-        });
+        let tls_manager = Arc::new(TlsManager::new());
+        tls_manager
+            .set_server_config(Some(Arc::new(
+                ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(DummyResolver)),
+            )))
+            .await;
+        tls_manager
+            .set_client_config(Some(Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth(),
+            )))
+            .await;
 
         let req = Request::get("/ready").body(Body::empty()).unwrap();
         let result =

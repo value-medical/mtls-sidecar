@@ -1,30 +1,41 @@
-use std::path::Path;
+use std::path::{PathBuf};
 use std::sync::Arc;
 
+use crate::config::Config;
+use crate::tls_manager::TlsManager;
 use anyhow::Result;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-use crate::tls_manager::TlsManager;
-
-fn should_watch_ca_dir(cert_dir: &str, ca_dir: &str) -> bool {
-    Path::new(ca_dir).exists() && ca_dir != cert_dir
+fn should_watch_dir(dir: &PathBuf) -> bool {
+    dir.try_exists().unwrap_or(false)
 }
 
-pub async fn start_watcher(
-    cert_dir: &str,
-    ca_dir: &str,
-    tls_manager: Arc<TlsManager>,
-) -> Result<()> {
+pub async fn start_watcher(config: Arc<Config>, tls_manager: Arc<TlsManager>) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(100);
 
     let mut watcher = notify::recommended_watcher(move |res| {
         let _ = tx.blocking_send(res);
     })?;
 
-    watcher.watch(Path::new(cert_dir), RecursiveMode::NonRecursive)?;
-    if should_watch_ca_dir(cert_dir, ca_dir) {
-        watcher.watch(Path::new(ca_dir), RecursiveMode::NonRecursive)?;
+    let mut watched_dirs: Vec<PathBuf> = vec![];
+    if let Some(ca_dir) = &config.ca_dir {
+        if should_watch_dir(ca_dir) {
+            watcher.watch(ca_dir, RecursiveMode::NonRecursive)?;
+            watched_dirs.push(ca_dir.clone());
+        }
+    }
+    if let Some(server_cert_dir) = &config.server_cert_dir {
+        if !watched_dirs.contains(server_cert_dir) && should_watch_dir(server_cert_dir) {
+            watcher.watch(server_cert_dir, RecursiveMode::NonRecursive)?;
+            watched_dirs.push(server_cert_dir.clone());
+        }
+    }
+    if let Some(client_cert_dir) = &config.client_cert_dir {
+        if !watched_dirs.contains(client_cert_dir) && should_watch_dir(client_cert_dir) {
+            watcher.watch(client_cert_dir, RecursiveMode::NonRecursive)?;
+            watched_dirs.push(client_cert_dir.clone());
+        }
     }
 
     while let Some(res) = rx.recv().await {
@@ -32,7 +43,7 @@ pub async fn start_watcher(
             Ok(event) => {
                 if is_relevant_event(&event) {
                     tracing::info!("File changed, reloading TLS config");
-                    match tls_manager.reload(cert_dir, ca_dir).await {
+                    match tls_manager.reload(&config).await {
                         Ok(_) => {
                             tracing::info!("Reload success");
                             crate::monitoring::TLS_RELOADS_TOTAL.inc();
@@ -122,32 +133,18 @@ mod tests {
     }
 
     #[test]
-    fn test_should_watch_ca_dir() {
+    fn test_should_watch_dir() {
         let temp_dir = TempDir::new().unwrap();
-        let cert_dir = temp_dir.path().join("cert");
-        let ca_dir_existing = temp_dir.path().join("ca");
-        let ca_dir_nonexistent = temp_dir.path().join("nonexistent");
+        let dir_existing = temp_dir.path().join("existing");
+        let dir_nonexistent = temp_dir.path().join("nonexistent");
 
-        // Create directories
-        fs::create_dir(&cert_dir).unwrap();
-        fs::create_dir(&ca_dir_existing).unwrap();
+        // Create directory
+        fs::create_dir(&dir_existing).unwrap();
 
-        // Test: ca_dir exists and is different from cert_dir
-        assert!(should_watch_ca_dir(
-            cert_dir.to_str().unwrap(),
-            ca_dir_existing.to_str().unwrap()
-        ));
+        // Test: dir exists
+        assert!(should_watch_dir(&dir_existing));
 
-        // Test: ca_dir does not exist
-        assert!(!should_watch_ca_dir(
-            cert_dir.to_str().unwrap(),
-            ca_dir_nonexistent.to_str().unwrap()
-        ));
-
-        // Test: ca_dir is the same as cert_dir
-        assert!(!should_watch_ca_dir(
-            cert_dir.to_str().unwrap(),
-            cert_dir.to_str().unwrap()
-        ));
+        // Test: dir does not exist
+        assert!(!should_watch_dir(&dir_nonexistent));
     }
 }

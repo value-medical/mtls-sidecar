@@ -21,6 +21,9 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
 
+use mtls_sidecar::config::Config;
+use mtls_sidecar::tls_manager::TlsManager;
+
 // Define a simple gRPC service for testing
 pub mod hello_world {
     include!("proto/gen/helloworld.rs");
@@ -46,8 +49,6 @@ impl Greeter for MyGreeter {
     }
 }
 
-use mtls_sidecar::tls_manager::TlsManager;
-
 struct TestCerts {
     _temp_dir: TempDir,
     cert_dir: std::path::PathBuf,
@@ -60,7 +61,7 @@ struct TestCerts {
 struct TestSetup {
     sidecar_port: u16,
     upstream_port: u16,
-    monitor_port: u16,
+    _monitor_port: u16,
     client: reqwest::Client,
     ca_cert: rcgen::Certificate,
     client_cert: rcgen::Certificate,
@@ -144,14 +145,16 @@ fn create_test_config(
     monitor_port: u16,
     test_certs: &TestCerts,
     inject_client_headers: bool,
-) -> mtls_sidecar::config::Config {
-    mtls_sidecar::config::Config {
-        tls_listen_port: sidecar_port,
+) -> Config {
+    Config {
+        tls_listen_port: Some(sidecar_port),
         upstream_url: format!("http://127.0.0.1:{}", upstream_port),
         upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
-        cert_dir: test_certs.cert_dir.to_str().unwrap().to_owned(),
-        ca_dir: test_certs.ca_dir.to_str().unwrap().to_owned(),
+        ca_dir: Some(test_certs.ca_dir.clone()),
+        server_cert_dir: Some(test_certs.cert_dir.clone()),
+        client_cert_dir: None,
         inject_client_headers,
+        outbound_proxy_port: None,
         monitor_port,
         enable_metrics: false,
     }
@@ -167,23 +170,28 @@ fn pick_ports() -> (u16, u16, u16) {
 async fn setup_test(
     test_certs: TestCerts,
     inject_headers: bool,
-) -> Result<(TestSetup, Arc<TlsManager>, mtls_sidecar::config::Config)> {
+) -> Result<(
+    TestSetup,
+    Arc<TlsManager>,
+    Arc<mtls_sidecar::config::Config>,
+)> {
     let (upstream_port, sidecar_port, monitor_port) = pick_ports();
-    let config = create_test_config(
+    let config = Arc::new(create_test_config(
         upstream_port,
         sidecar_port,
         monitor_port,
         &test_certs,
         inject_headers,
-    );
-    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+    ));
+    let tls_manager = Arc::new(TlsManager::new());
+    tls_manager.reload(&config).await?;
     start_sidecar(&config, Arc::clone(&tls_manager)).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     let client = create_client_builder_with_cert(&test_certs)?.build()?;
     let setup = TestSetup {
         sidecar_port,
         upstream_port,
-        monitor_port,
+        _monitor_port: monitor_port,
         client,
         ca_cert: test_certs.ca_cert.clone(),
         client_cert: test_certs.client_cert.clone(),
@@ -284,17 +292,17 @@ async fn start_sidecar(
     tls_manager: Arc<TlsManager>,
 ) -> Result<()> {
     let sidecar_listener =
-        TcpListener::bind(format!("127.0.0.1:{}", config.tls_listen_port)).await?;
+        TcpListener::bind(format!("127.0.0.1:{}", config.tls_listen_port.unwrap())).await?;
     let upstream_url = config.upstream_url.clone();
     let inject = config.inject_client_headers;
     tokio::spawn(async move {
         loop {
             let (stream, _) = sidecar_listener.accept().await.unwrap();
             let peer_addr = stream.peer_addr().ok();
-            let tls_manager = Arc::clone(&tls_manager);
             let upstream = upstream_url.clone();
+            let tls_manager = Arc::clone(&tls_manager);
             tokio::spawn(async move {
-                let current_config = tls_manager.config.read().await.clone();
+                let current_config = tls_manager.server_config.read().await.clone().unwrap();
                 let acceptor = TlsAcceptor::from(current_config);
                 let stream = acceptor.accept(stream).await.unwrap();
                 let (_, server_conn) = stream.get_ref();
@@ -396,22 +404,22 @@ async fn test_file_watching_reload() -> Result<()> {
     start_basic_upstream(upstream_port, Bytes::from("OK")).await?;
 
     // Start sidecar
-    let config = create_test_config(
+    let config = Arc::new(create_test_config(
         upstream_port,
         sidecar_port,
         monitor_port,
         &test_certs,
         false,
-    );
-    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+    ));
+    let tls_manager = Arc::new(TlsManager::new());
+    tls_manager.reload(&config).await?;
+    let watcher_config = Arc::clone(&config);
     let watcher_tls_manager = Arc::clone(&tls_manager);
     let reload_tls_manager = Arc::clone(&tls_manager);
-    let cert_dir_clone = config.cert_dir.clone();
-    let ca_dir_clone = config.ca_dir.clone();
 
     // Spawn watcher
     tokio::spawn(async move {
-        mtls_sidecar::watcher::start_watcher(&cert_dir_clone, &ca_dir_clone, watcher_tls_manager)
+        mtls_sidecar::watcher::start_watcher(watcher_config, watcher_tls_manager)
             .await
             .unwrap();
     });
@@ -443,9 +451,7 @@ async fn test_file_watching_reload() -> Result<()> {
     std::fs::write(test_certs.ca_dir.join("ca-bundle.crt"), new_ca_cert.pem())?;
 
     // Manually trigger reload to ensure it works (file watching may not trigger in test env)
-    reload_tls_manager
-        .reload(&config.cert_dir, &config.ca_dir)
-        .await?;
+    reload_tls_manager.reload(&config).await?;
 
     // Wait a bit
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -496,7 +502,8 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
         false,
     );
     config.upstream_url = format!("http://127.0.0.1:{}/grpc", upstream_port);
-    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+    let tls_manager = Arc::new(TlsManager::new());
+    tls_manager.reload(&config).await?;
     let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
     let upstream_url = config.upstream_url.clone();
     tokio::spawn(async move {
@@ -506,7 +513,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
             let tls_manager = Arc::clone(&tls_manager);
             let upstream = upstream_url.clone();
             tokio::spawn(async move {
-                let current_config = tls_manager.config.read().await.clone();
+                let current_config = tls_manager.server_config.read().await.clone().unwrap();
                 let acceptor = TlsAcceptor::from(current_config);
                 let stream = match acceptor.accept(stream).await {
                     Ok(s) => s,
@@ -645,7 +652,8 @@ async fn test_readiness_probe_certificate_expiry() -> Result<()> {
     start_readiness_upstream(upstream_port).await?;
 
     // Start monitoring server
-    let router = mtls_sidecar::monitoring::create_router(&config, Arc::clone(&tls_manager));
+    let router =
+        mtls_sidecar::monitoring::create_router(Arc::clone(&config), Arc::clone(&tls_manager));
     let monitor_addr = format!("127.0.0.1:{}", monitor_port);
     let monitor_listener = TcpListener::bind(&monitor_addr).await?;
     tokio::spawn(async move {
@@ -772,7 +780,8 @@ async fn test_proxy_grpc() -> Result<()> {
         &test_certs,
         false,
     );
-    let tls_manager = Arc::new(TlsManager::new(&config).await?);
+    let tls_manager = Arc::new(TlsManager::new());
+    tls_manager.reload(&config).await?;
 
     // Spawn server
     start_sidecar(&config, Arc::clone(&tls_manager)).await?;

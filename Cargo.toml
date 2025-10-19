@@ -13,6 +13,7 @@ rustls-pemfile = "2.1"
 tokio-rustls = "0.26"
 hyper = { version = "1.7", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy"] }
+hyper-rustls = "0.27"
 http-body-util = "0.1"
 bytes = "1.0"
 tracing = "0.1"
@@ -32,6 +33,7 @@ tempfile = "3.23"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 time = "0.3"
 portpicker = "0.1"
+log = "0.4.28"
 
 [dev-dependencies]
 tempfile = "3.23"

@@ -27,40 +27,46 @@ async fn main() -> Result<()> {
 
     // Load config
     let config = config::Config::from_env().context("Failed to load config")?;
-    tracing::info!(
-        "Config loaded: port={}, upstream={}, cert_dir={}, ca_dir={}",
-        config.tls_listen_port,
-        config.upstream_url,
-        config.cert_dir,
-        config.ca_dir
-    );
+    tracing::debug!("config = {:?}", config);
+    let config = Arc::new(config);
+
+    // Create TlsManager
+    let mut tls_manager = TlsManager::new();
+    if config.tls_listen_port.is_some() {
+        tls_manager.server_required = true;
+    }
+    if config.outbound_proxy_port.is_some() {
+        tls_manager.client_required = true;
+    }
+    tls_manager
+        .reload(&config)
+        .await
+        .context("Failed to load TLS config")?;
+    tracing::info!("TLS loaded");
+    let tls_manager = Arc::new(tls_manager);
 
     // Create HTTP client
     let client: Arc<Client<HttpConnector, Incoming>> =
         Arc::new(Client::builder(TokioExecutor::new()).build_http());
     tracing::info!("HTTP client created");
 
-    // Create TlsManager
-    let tls_manager = Arc::new(
-        TlsManager::new(&config)
-            .await
-            .context("Failed to load TLS config")?,
-    );
-    tracing::info!("TLS loaded");
-
     // Start file watcher
-    let cert_dir = config.cert_dir.clone();
-    let ca_dir = config.ca_dir.clone();
+    let watcher_config = Arc::clone(&config);
     let watcher_tls_manager = Arc::clone(&tls_manager);
     tokio::spawn(async move {
-        if let Err(e) = watcher::start_watcher(&cert_dir, &ca_dir, watcher_tls_manager).await {
+        if let Err(e) = watcher::start_watcher(
+            watcher_config,
+            watcher_tls_manager,
+        )
+        .await
+        {
             tracing::error!("Watcher error: {:?}", e);
         }
     });
 
     // Start monitoring server
     if config.monitor_port != 0 {
-        let router = monitoring::create_router(&config, Arc::clone(&tls_manager));
+        let router = monitoring::create_router(Arc::clone(&config), Arc::clone(&tls_manager));
         let addr = format!("0.0.0.0:{}", config.monitor_port);
         let listener = TcpListener::bind(&addr)
             .await
@@ -73,8 +79,38 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Start outbound proxy server
+    if let Some(outbound_port) = config.outbound_proxy_port {
+        let outbound_addr = format!("0.0.0.0:{}", outbound_port);
+        let outbound_listener = TcpListener::bind(&outbound_addr).await.context(format!(
+            "Failed to bind outbound proxy to {}",
+            outbound_addr
+        ))?;
+        tracing::info!("Outbound proxy listening on {}", outbound_addr);
+        let tls_manager_outbound = Arc::clone(&tls_manager);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = outbound_listener.accept().await.unwrap();
+                let tls_manager = Arc::clone(&tls_manager_outbound);
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| {
+                        let tls_mgr = Arc::clone(&tls_manager);
+                        async move { mtls_sidecar::proxy_outbound::handler(req, &tls_mgr).await }
+                    });
+                    if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                    {
+                        tracing::error!("Error serving outbound connection: {:?}", err);
+                    }
+                });
+            }
+        });
+    }
+
     // Bind to configured port
-    let addr = format!("0.0.0.0:{}", config.tls_listen_port);
+    let tls_listen_port = config.tls_listen_port.unwrap_or(8443);
+    let addr = format!("0.0.0.0:{}", tls_listen_port);
     let listener = TcpListener::bind(&addr)
         .await
         .context(format!("Failed to bind to {}", addr))?;
@@ -111,7 +147,7 @@ async fn main() -> Result<()> {
 
                         tokio::spawn(async move {
                             let peer_addr = stream.peer_addr().ok();
-                            let current_config = tls_manager.config.read().await.clone();
+                            let current_config = tls_manager.server_config.read().await.as_ref().unwrap().clone();
                             let acceptor = TlsAcceptor::from(current_config);
 
                             let stream = match acceptor.accept(stream).await {
