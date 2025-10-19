@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Result};
+use crate::error::DomainError;
+use anyhow::{Result, Error};
 use hyper::Uri;
 use std::collections::HashMap;
 use std::env;
@@ -19,11 +20,11 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env() -> Result<Self, Error> {
         Self::from_env_map(None)
     }
 
-    fn from_env_map(env_map: Option<&HashMap<String, String>>) -> Result<Self> {
+    fn from_env_map(env_map: Option<&HashMap<String, String>>) -> Result<Self, Error> {
         let get_var = |key: &str| -> String {
             if let Some(map) = env_map {
                 map.get(key).cloned()
@@ -52,9 +53,9 @@ impl Config {
         } else {
             let port: u16 = tls_listen_port_str
                 .parse()
-                .map_err(|_| anyhow!("Invalid TLS_LISTEN_PORT: {}", tls_listen_port_str))?;
+                .map_err(|_| DomainError::Config(format!("Invalid TLS_LISTEN_PORT: {}", tls_listen_port_str)))?;
             if port == 0 {
-                return Err(anyhow!("TLS_LISTEN_PORT cannot be 0"));
+                return Err(DomainError::Config("TLS_LISTEN_PORT cannot be 0".to_string()).into());
             }
             Some(port)
         };
@@ -63,9 +64,9 @@ impl Config {
         let upstream_url_str = get_var("UPSTREAM_URL");
         let upstream_uri: Uri = upstream_url_str
             .parse()
-            .map_err(|_| anyhow!("Invalid UPSTREAM_URL: {}", upstream_url_str))?;
+            .map_err(|_| DomainError::Config(format!("Invalid UPSTREAM_URL: {}", upstream_url_str)))?;
         if upstream_uri.scheme_str() != Some("http") {
-            return Err(anyhow!("UPSTREAM_URL must be HTTP"));
+            return Err(DomainError::Config("UPSTREAM_URL must be HTTP".to_string()).into());
         }
 
         // Validate CA_DIR
@@ -107,22 +108,22 @@ impl Config {
         // Validate INJECT_CLIENT_HEADERS
         let inject_client_headers_str = get_var("INJECT_CLIENT_HEADERS");
         let inject_client_headers: bool = inject_client_headers_str.parse().map_err(|_| {
-            anyhow!(
+            DomainError::Config(format!(
                 "Invalid INJECT_CLIENT_HEADERS: {}",
                 inject_client_headers_str
-            )
+            ))
         })?;
 
         // Validate UPSTREAM_READINESS_URL
         let upstream_readiness_url_str = get_var("UPSTREAM_READINESS_URL");
         let upstream_readiness_uri: Uri = upstream_readiness_url_str.parse().map_err(|_| {
-            anyhow!(
+            DomainError::Config(format!(
                 "Invalid UPSTREAM_READINESS_URL: {}",
                 upstream_readiness_url_str
-            )
+            ))
         })?;
         if upstream_readiness_uri.scheme_str() != Some("http") {
-            return Err(anyhow!("UPSTREAM_READINESS_URL must be HTTP"));
+            return Err(DomainError::Config("UPSTREAM_READINESS_URL must be HTTP".to_string()).into());
         }
 
         // Validate OUTBOUND_PROXY_PORT
@@ -132,9 +133,9 @@ impl Config {
         } else {
             let port: u16 = outbound_proxy_port_str
                 .parse()
-                .map_err(|_| anyhow!("Invalid OUTBOUND_PROXY_PORT: {}", outbound_proxy_port_str))?;
+                .map_err(|_| DomainError::Config(format!("Invalid OUTBOUND_PROXY_PORT: {}", outbound_proxy_port_str)))?;
             if port == 0 {
-                return Err(anyhow!("OUTBOUND_PROXY_PORT cannot be 0"));
+                return Err(DomainError::Config("OUTBOUND_PROXY_PORT cannot be 0".to_string()).into());
             }
             Some(port)
         };
@@ -144,7 +145,7 @@ impl Config {
         let monitor_port_str = get_var("MONITOR_PORT");
         let monitor_port: u16 = monitor_port_str
             .parse()
-            .map_err(|_| anyhow!("Invalid MONITOR_PORT: {}", monitor_port_str))?;
+            .map_err(|_| DomainError::Config(format!("Invalid MONITOR_PORT: {}", monitor_port_str)))?;
         if monitor_port == 0 {
             tracing::warn!("MONITOR_PORT is 0, monitoring server will be disabled");
         }
@@ -153,7 +154,7 @@ impl Config {
         let enable_metrics_str = get_var("ENABLE_METRICS");
         let enable_metrics: bool = enable_metrics_str
             .parse()
-            .map_err(|_| anyhow!("Invalid ENABLE_METRICS: {}", enable_metrics_str))?;
+            .map_err(|_| DomainError::Config(format!("Invalid ENABLE_METRICS: {}", enable_metrics_str)))?;
 
         Ok(Config {
             tls_listen_port,

@@ -971,7 +971,7 @@ async fn test_outbound_proxy_with_invalid_server_cert() -> Result<()> {
     let test_certs = setup_certificates()?;
 
     // Generate different CA for upstream
-    let (bad_ca_cert, bad_issuer) = generate_ca();
+    let (_bad_ca_cert, bad_issuer) = generate_ca();
     let (bad_server_cert, bad_server_key) = generate_server_cert(&bad_issuer);
 
     // Write bad certs

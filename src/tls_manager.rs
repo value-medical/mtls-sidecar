@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::Config;
-use anyhow::{Context, Result};
+use crate::error::DomainError;
+use anyhow::{Context, Error, Result};
 use chrono::{DateTime, Utc};
 use log::error;
 use rustls::server::WebPkiClientVerifier;
@@ -10,7 +11,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::{pem::PemObject, PrivateKeyDer};
 use tokio::fs;
 use tokio::sync::RwLock;
-use x509_parser::{parse_x509_certificate};
+use x509_parser::parse_x509_certificate;
 
 pub struct TlsManager {
     pub server_config: RwLock<Option<Arc<ServerConfig>>>,
@@ -39,7 +40,7 @@ impl TlsManager {
         *self.client_config.write().await = client_config;
     }
 
-    pub async fn reload(&self, config: &Config) -> Result<()> {
+    pub async fn reload(&self, config: &Config) -> Result<(), Error> {
         // Load CA certs, server cert/key, client cert/key
         let ca_certs = Self::load_ca_certs(
             &config.ca_dir,
@@ -98,7 +99,7 @@ impl TlsManager {
         ca_dir_opt: &Option<PathBuf>,
         server_cert_dir_opt: &Option<PathBuf>,
         client_cert_dir_opt: &Option<PathBuf>,
-    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Error> {
         let mut ca_certs = Vec::new();
 
         if let Some(ca_dir) = ca_dir_opt {
@@ -107,13 +108,23 @@ impl TlsManager {
                 ca_certs.extend(
                     rustls_pemfile::certs(&mut ca_pem.as_slice())
                         .collect::<Result<Vec<_>, _>>()
-                        .context("Failed to parse CA bundle from ca-bundle.crt")?,
+                        .map_err(|e| {
+                            DomainError::Certificate(format!(
+                                "Failed to parse CA bundle from ca-bundle.crt: {}",
+                                e
+                            ))
+                        })?,
                 );
             } else if let Ok(ca_pem) = fs::read(ca_dir.join("ca.crt")).await {
                 ca_certs.extend(
                     rustls_pemfile::certs(&mut ca_pem.as_slice())
                         .collect::<Result<Vec<_>, _>>()
-                        .context("Failed to parse CA bundle from ca.crt")?,
+                        .map_err(|e| {
+                            DomainError::Certificate(format!(
+                                "Failed to parse CA bundle from ca.crt: {}",
+                                e
+                            ))
+                        })?,
                 );
             } else {
                 error!("No CA bundle found in ca_dir: {}", ca_dir.to_string_lossy());
@@ -164,6 +175,7 @@ impl TlsManager {
             Vec<rustls::pki_types::CertificateDer<'static>>,
             PrivateKeyDer<'static>,
         )>,
+        Error,
     > {
         // Auto-detect cert and key files
         let (cert_path, key_path) = Self::find_cert_key(&cert_dir, "tls.crt", "tls.key")
@@ -180,10 +192,12 @@ impl TlsManager {
         tracing::info!("Using private key: {}", key_path.to_string_lossy());
 
         // Read certificate
-        let cert_pem = fs::read(&cert_path).await.context(format!(
-            "Failed to read server certificate from {}",
-            cert_path.to_string_lossy()
-        ))?;
+        let cert_pem = fs::read(&cert_path).await.with_context(|| {
+            format!(
+                "Failed to read server certificate from {}",
+                cert_path.to_string_lossy()
+            )
+        })?;
         let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to parse server certificate")?;
@@ -206,15 +220,16 @@ impl TlsManager {
             Vec<rustls::pki_types::CertificateDer<'static>>,
             PrivateKeyDer<'static>,
         )>,
+        Error,
     > {
         // Auto-detect cert and key files
         let (cert_path, key_path) = Self::find_cert_key(&cert_dir, "tls.crt", "tls.key")
             .or_else(|| Self::find_cert_key(&cert_dir, "certificate", "private_key"))
             .ok_or_else(|| {
-                anyhow::anyhow!(
+                DomainError::Other(format!(
                     "No valid cert/key pair found in {}",
                     cert_dir.to_string_lossy()
-                )
+                ))
             })?;
 
         // Log the paths being used
@@ -274,7 +289,7 @@ impl TlsManager {
         certs: Vec<rustls::pki_types::CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
         ca_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-    ) -> Result<ServerConfig> {
+    ) -> Result<ServerConfig, Error> {
         let config_builder = ServerConfig::builder();
 
         let config = if ca_certs.is_empty() {
@@ -311,7 +326,7 @@ impl TlsManager {
         certs: Vec<rustls::pki_types::CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
         ca_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-    ) -> Result<ClientConfig> {
+    ) -> Result<ClientConfig, Error> {
         // Build root cert store
         let mut roots = RootCertStore::empty();
         for cert in ca_certs {
@@ -324,7 +339,7 @@ impl TlsManager {
         let config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_client_auth_cert(certs, key)
-            .map_err(|e| anyhow::anyhow!("Failed to build client config: {}", e))?;
+            .context("Failed to build client config")?;
 
         Ok(config)
     }

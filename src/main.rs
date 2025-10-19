@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -6,6 +5,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use anyhow::{Context, Error, Result};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
@@ -15,7 +15,7 @@ use mtls_sidecar::{config, monitoring, proxy_inbound, tls_manager, watcher};
 use tls_manager::TlsManager;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Error> {
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
         .expect("Failed to install rustls crypto provider");
 

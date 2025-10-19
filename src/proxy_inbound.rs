@@ -1,4 +1,5 @@
-use anyhow::Result;
+use crate::error::DomainError;
+use anyhow::{Error, Result};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -15,7 +16,7 @@ pub async fn handler<B, C>(
     inject_client_headers: bool,
     client: C,
     client_addr: Option<std::net::SocketAddr>,
-) -> Result<Response<ProxiedBody>>
+) -> Result<Response<ProxiedBody>, Error>
 where
     B: Body<Data = Bytes>,
     B::Error: Into<BodyError>,
@@ -56,7 +57,7 @@ where
     let upstream_uri = match upstream_uri_str.parse::<Uri>() {
         Err(e) => {
             tracing::error!("Invalid upstream URI: {:?}", e);
-            return Err(anyhow::anyhow!(e.to_string()));
+            return Err(DomainError::from(e).into());
         }
         Ok(uri) => uri,
     };
@@ -86,7 +87,8 @@ where
     // If inject_client_headers, parse cert and add headers
     if inject_client_headers {
         if let Some(cert_der) = client_cert {
-            upstream_req_builder = client_cert::inject_client_headers(upstream_req_builder, cert_der);
+            upstream_req_builder =
+                client_cert::inject_client_headers(upstream_req_builder, cert_der);
         }
     }
 
@@ -101,14 +103,16 @@ where
     // Set X-Forwarded-Proto, X-Forwarded-For headers
     upstream_req_builder = upstream_req_builder.header("X-Forwarded-Proto", "https");
     if let Some(addr) = client_addr {
-        upstream_req_builder = upstream_req_builder.header("X-Forwarded-For", addr.ip().to_string());
+        upstream_req_builder =
+            upstream_req_builder.header("X-Forwarded-For", addr.ip().to_string());
     }
 
     // Send request to upstream
-    let upstream_req = upstream_req_builder
-        .body(body)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let resp = client.request(upstream_req).await?;
+    let upstream_req = upstream_req_builder.body(body)?;
+    let resp = client
+        .request(upstream_req)
+        .await
+        .map_err(|e| DomainError::from(e))?;
 
     tracing::info!("Proxied request {} {}", parts.method.clone(), uri);
     REQUESTS_TOTAL.inc();
@@ -126,7 +130,9 @@ where
         builder = builder.header(k, v);
     }
 
-    let response = builder.body(proxied_body).map_err(|e| anyhow::anyhow!(e))?;
+    let response = builder
+        .body(proxied_body)
+        .map_err(|e| DomainError::from(e))?;
 
     tracing::info!("Response status: {}", parts.status);
 

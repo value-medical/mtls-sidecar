@@ -222,6 +222,7 @@ kubectl delete -f examples/kubernetes/cert-ca.yaml
 ### Error Handling
 
 - Use `anyhow::Result<T>` throughout the codebase; chain errors with `.context("Descriptive message")`.
+- Use `crate::error::DomainError` for domain-specific errors.
 - For non-fatal errors (e.g., reload failures), log at `tracing::warn!` or `error!` and continue with previous state.
 - Fatal errors (e.g., initial config load) should exit gracefully with code 1.
 
