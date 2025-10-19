@@ -7,6 +7,7 @@ use hyper::header::HOST;
 use hyper::{body::Body, http::Uri, Request, Response, StatusCode};
 
 use crate::client_cert;
+use crate::header_filter;
 use crate::http_client_like::{BodyError, HttpClientLike, ProxiedBody};
 use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
 
@@ -68,19 +69,7 @@ where
         .uri(upstream_uri.clone());
 
     // Copy headers from original request
-    for (key, value) in parts.headers.iter() {
-        // Filter out Host header to avoid conflicts
-        if key == HOST {
-            continue;
-        }
-        // Filter out `X-Client-*` headers to avoid injection
-        if key.as_str().starts_with("x-client-") {
-            continue;
-        }
-        // Filter out `Proxy-*` headers to avoid confusion (we don't use these)
-        if key.as_str().starts_with("proxy-") {
-            continue;
-        }
+    for (key, value) in header_filter::filter_headers(&parts.headers, true) {
         upstream_req_builder = upstream_req_builder.header(key, value);
     }
 

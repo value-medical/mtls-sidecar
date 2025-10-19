@@ -1,6 +1,7 @@
 pub mod client_cert;
 pub mod config;
 pub mod error;
+pub mod header_filter;
 pub mod http_client_like;
 pub mod monitoring;
 pub mod proxy_inbound;

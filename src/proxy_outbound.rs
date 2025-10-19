@@ -1,3 +1,4 @@
+use crate::header_filter;
 use crate::tls_manager::TlsManager;
 use anyhow::Result;
 use bytes::Bytes;
@@ -55,12 +56,7 @@ where
         .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
 
     // Create HTTPS connector
-    let client_config = tls_manager
-        .client_config
-        .read()
-        .await
-        .clone()
-        .unwrap();
+    let client_config = tls_manager.client_config.read().await.clone().unwrap();
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config((*client_config).clone())
         .https_only()
@@ -77,15 +73,7 @@ where
         .uri(https_uri.clone());
 
     // Copy headers from original request
-    for (key, value) in parts.headers.iter() {
-        // Filter out Host header to avoid conflicts
-        if key == HOST {
-            continue;
-        }
-        // Filter out Proxy-* headers
-        if key.as_str().starts_with("proxy-") {
-            continue;
-        }
+    for (key, value) in header_filter::filter_headers(&parts.headers, false) {
         upstream_req_builder = upstream_req_builder.header(key, value);
     }
 
