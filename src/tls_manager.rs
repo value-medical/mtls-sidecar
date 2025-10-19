@@ -275,28 +275,34 @@ impl TlsManager {
         key: PrivateKeyDer<'static>,
         ca_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     ) -> Result<ServerConfig> {
-        if ca_certs.is_empty() {
-            return Err(anyhow::anyhow!("No CA certificates found"));
-        }
+        let config_builder = ServerConfig::builder();
 
-        // Build root cert store
-        let mut roots = RootCertStore::empty();
-        for cert in ca_certs {
-            roots
-                .add(cert)
-                .map_err(|e| anyhow::anyhow!("Failed to add CA cert: {}", e))?;
-        }
+        let config = if ca_certs.is_empty() {
+            // No client cert required
+            config_builder
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| anyhow::anyhow!("Failed to build server config: {}", e))?
+        } else {
+            // Build root cert store
+            let mut roots = RootCertStore::empty();
+            for cert in ca_certs {
+                roots
+                    .add(cert)
+                    .map_err(|e| anyhow::anyhow!("Failed to add CA cert: {}", e))?;
+            }
 
-        // Create client verifier that requires client certs
-        let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .context("Failed to build client verifier")?;
+            // Create client verifier that requires client certs
+            let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .context("Failed to build client verifier")?;
 
-        // Build server config
-        let config = ServerConfig::builder()
-            .with_client_cert_verifier(client_verifier)
-            .with_single_cert(certs, key)
-            .map_err(|e| anyhow::anyhow!("Failed to build server config: {}", e))?;
+            // Build server config
+            config_builder
+                .with_client_cert_verifier(client_verifier)
+                .with_single_cert(certs, key)
+                .map_err(|e| anyhow::anyhow!("Failed to build server config: {}", e))?
+        };
 
         Ok(config)
     }

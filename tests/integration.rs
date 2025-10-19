@@ -3,7 +3,7 @@ use axum;
 use base64;
 use base64::Engine;
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
@@ -13,6 +13,7 @@ use portpicker;
 use rcgen::{CertificateParams, DnType, Issuer, KeyPair};
 use reqwest::Certificate;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 use time::Duration;
@@ -110,7 +111,7 @@ fn generate_ca() -> (rcgen::Certificate, Issuer<'static, KeyPair>) {
 }
 
 fn generate_server_cert(issuer: &Issuer<KeyPair>) -> (rcgen::Certificate, KeyPair) {
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let mut params = CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()]).unwrap();
     params
         .distinguished_name
         .push(DnType::CommonName, "localhost");
@@ -145,6 +146,8 @@ fn create_test_config(
     monitor_port: u16,
     test_certs: &TestCerts,
     inject_client_headers: bool,
+    outbound_proxy_port: Option<u16>,
+    client_cert_dir: Option<PathBuf>,
 ) -> Config {
     Config {
         tls_listen_port: Some(sidecar_port),
@@ -152,9 +155,9 @@ fn create_test_config(
         upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
         ca_dir: Some(test_certs.ca_dir.clone()),
         server_cert_dir: Some(test_certs.cert_dir.clone()),
-        client_cert_dir: None,
+        client_cert_dir,
         inject_client_headers,
-        outbound_proxy_port: None,
+        outbound_proxy_port,
         monitor_port,
         enable_metrics: false,
     }
@@ -182,6 +185,8 @@ async fn setup_test(
         monitor_port,
         &test_certs,
         inject_headers,
+        None,
+        None,
     ));
     let tls_manager = Arc::new(TlsManager::new());
     tls_manager.reload(&config).await?;
@@ -276,6 +281,46 @@ async fn start_readiness_upstream(port: u16) -> Result<()> {
                     } else {
                         Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("Hello"))))
                     }
+                });
+                auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    Ok(())
+}
+
+async fn start_https_upstream(port: u16, response: Bytes, test_certs: &TestCerts) -> Result<()> {
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let tls_manager = Arc::new(TlsManager::new());
+    let config = Config {
+        tls_listen_port: Some(port),
+        upstream_url: "dummy".to_string(),
+        upstream_readiness_url: "dummy".to_string(),
+        ca_dir: None, // Do not require client cert for simplicity
+        server_cert_dir: Some(test_certs.cert_dir.clone()),
+        client_cert_dir: None,
+        inject_client_headers: false,
+        outbound_proxy_port: None,
+        monitor_port: 8081,
+        enable_metrics: false,
+    };
+    tls_manager.reload(&config).await?;
+    let resp = response;
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let tls_manager = Arc::clone(&tls_manager);
+            let r = resp.clone();
+            tokio::spawn(async move {
+                let current_config = tls_manager.server_config.read().await.clone().unwrap();
+                let acceptor = TlsAcceptor::from(current_config);
+                let stream = acceptor.accept(stream).await.unwrap();
+                let service = service_fn(move |_req| {
+                    let r = r.clone();
+                    async move { Ok::<_, hyper::Error>(Response::new(Full::new(r))) }
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -410,6 +455,8 @@ async fn test_file_watching_reload() -> Result<()> {
         monitor_port,
         &test_certs,
         false,
+        None,
+        None,
     ));
     let tls_manager = Arc::new(TlsManager::new());
     tls_manager.reload(&config).await?;
@@ -500,6 +547,8 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
         monitor_port,
         &test_certs,
         false,
+        None,
+        None,
     );
     config.upstream_url = format!("http://127.0.0.1:{}/grpc", upstream_port);
     let tls_manager = Arc::new(TlsManager::new());
@@ -779,6 +828,8 @@ async fn test_proxy_grpc() -> Result<()> {
         monitor_port,
         &test_certs,
         false,
+        None,
+        None,
     );
     let tls_manager = Arc::new(TlsManager::new());
     tls_manager.reload(&config).await?;
@@ -834,9 +885,282 @@ async fn test_proxy_grpc() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_outbound_proxy_with_valid_certs() -> Result<()> {
+    let (upstream_port, outbound_proxy_port, monitor_port) = pick_ports();
+
+    let test_certs = setup_certificates()?;
+
+    // Start HTTPS upstream server requiring client certs
+    start_https_upstream(upstream_port, Bytes::from("Hello from HTTPS upstream"), &test_certs).await?;
+
+    // Create client cert dir
+    let client_cert_dir = test_certs._temp_dir.path().join("client-certs");
+    std::fs::create_dir(&client_cert_dir)?;
+    std::fs::write(client_cert_dir.join("tls.crt"), test_certs.client_cert.pem())?;
+    std::fs::write(client_cert_dir.join("tls.key"), test_certs.client_key.serialize_pem())?;
+
+    // Create config for outbound proxy
+    let config = create_test_config(
+        upstream_port,
+        0, // sidecar_port not used
+        monitor_port,
+        &test_certs,
+        false,
+        Some(outbound_proxy_port),
+        Some(client_cert_dir),
+    );
+
+    // Override upstream_url to HTTPS
+    let config = Config {
+        upstream_url: format!("https://127.0.0.1:{}", upstream_port),
+        ..config
+    };
+    let config = Arc::new(config);
+
+    let tls_manager = Arc::new(TlsManager::new());
+    tls_manager.reload(&config).await?;
+
+    // Start outbound proxy listener
+    let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
+    let outbound_listener = TcpListener::bind(&outbound_addr).await?;
+    let tls_manager_outbound = Arc::clone(&tls_manager);
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = outbound_listener.accept().await.unwrap();
+            let tls_manager = Arc::clone(&tls_manager_outbound);
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    let tls_mgr = Arc::clone(&tls_manager);
+                    async move { mtls_sidecar::proxy_outbound::handler(req, &tls_mgr).await }
+                });
+                if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                {
+                    tracing::error!("Error serving outbound connection: {:?}", err);
+                }
+            });
+        }
+    });
+
+    // Wait for servers to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Make HTTP request to outbound proxy with target URI
+    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", outbound_proxy_port)).await?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    tokio::spawn(async move {
+        conn.await.unwrap();
+    });
+    let req = Request::get(format!("http://127.0.0.1:{}/", upstream_port))
+        .body(Full::new(Bytes::new()))?;
+    let resp = sender.send_request(req).await?;
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await?.to_bytes();
+    let text = String::from_utf8(body.to_vec())?;
+    assert_eq!(text, "Hello from HTTPS upstream");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_outbound_proxy_with_invalid_server_cert() -> Result<()> {
+    let (upstream_port, outbound_proxy_port, monitor_port) = pick_ports();
+
+    let test_certs = setup_certificates()?;
+
+    // Generate different CA for upstream
+    let (bad_ca_cert, bad_issuer) = generate_ca();
+    let (bad_server_cert, bad_server_key) = generate_server_cert(&bad_issuer);
+
+    // Write bad certs
+    let bad_cert_dir = test_certs._temp_dir.path().join("bad-certs");
+    std::fs::create_dir(&bad_cert_dir)?;
+    std::fs::write(bad_cert_dir.join("tls.crt"), bad_server_cert.pem())?;
+    std::fs::write(bad_cert_dir.join("tls.key"), bad_server_key.serialize_pem())?;
+
+    // Start HTTPS upstream with bad cert
+    start_https_upstream_with_cert_dir(upstream_port, Bytes::from("Hello from bad upstream"), &bad_cert_dir).await?;
+
+    // Create client cert dir
+    let client_cert_dir = test_certs._temp_dir.path().join("client-certs");
+    std::fs::create_dir(&client_cert_dir)?;
+    std::fs::write(client_cert_dir.join("tls.crt"), test_certs.client_cert.pem())?;
+    std::fs::write(client_cert_dir.join("tls.key"), test_certs.client_key.serialize_pem())?;
+
+    // Create config for outbound proxy
+    let config = create_test_config(
+        upstream_port,
+        0,
+        monitor_port,
+        &test_certs,
+        false,
+        Some(outbound_proxy_port),
+        Some(client_cert_dir),
+    );
+    let config = Config {
+        upstream_url: format!("https://127.0.0.1:{}", upstream_port),
+        ..config
+    };
+    let config = Arc::new(config);
+
+    let tls_manager = Arc::new(TlsManager::new());
+    tls_manager.reload(&config).await?;
+
+    // Start outbound proxy listener
+    let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
+    let outbound_listener = TcpListener::bind(&outbound_addr).await?;
+    let tls_manager_outbound = Arc::clone(&tls_manager);
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = outbound_listener.accept().await.unwrap();
+            let tls_manager = Arc::clone(&tls_manager_outbound);
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    let tls_mgr = Arc::clone(&tls_manager);
+                    async move { mtls_sidecar::proxy_outbound::handler(req, &tls_mgr).await }
+                });
+                if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                {
+                    tracing::error!("Error serving outbound connection: {:?}", err);
+                }
+            });
+        }
+    });
+
+    // Wait for servers to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Make HTTP request to outbound proxy with target URI
+    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", outbound_proxy_port)).await?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    tokio::spawn(async move {
+        conn.await.unwrap();
+    });
+    let req = Request::get(format!("http://127.0.0.1:{}/", upstream_port))
+        .body(Full::new(Bytes::new()))?;
+    let result = sender.send_request(req).await;
+    // Should fail because server cert is not trusted
+    assert!(result.is_err());
+
+    Ok(())
+}
+
+async fn start_https_upstream_with_cert_dir(port: u16, response: Bytes, cert_dir: &std::path::Path) -> Result<()> {
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let tls_manager = Arc::new(TlsManager::new());
+    let config = Config {
+        tls_listen_port: Some(port),
+        upstream_url: "dummy".to_string(),
+        upstream_readiness_url: "dummy".to_string(),
+        ca_dir: None,
+        server_cert_dir: Some(cert_dir.to_path_buf()),
+        client_cert_dir: None,
+        inject_client_headers: false,
+        outbound_proxy_port: None,
+        monitor_port: 8081,
+        enable_metrics: false,
+    };
+    tls_manager.reload(&config).await?;
+    let resp = response;
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let tls_manager = Arc::clone(&tls_manager);
+            let r = resp.clone();
+            tokio::spawn(async move {
+                let current_config = tls_manager.server_config.read().await.clone().unwrap();
+                let acceptor = TlsAcceptor::from(current_config);
+                let stream = acceptor.accept(stream).await.unwrap();
+                let service = service_fn(move |_req| {
+                    let r = r.clone();
+                    async move { Ok::<_, hyper::Error>(Response::new(Full::new(r))) }
+                });
+                auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_outbound_proxy_with_missing_client_cert() -> Result<()> {
+    let (upstream_port, outbound_proxy_port, monitor_port) = pick_ports();
+
+    let test_certs = setup_certificates()?;
+
+    // Start HTTPS upstream
+    start_https_upstream(upstream_port, Bytes::from("Hello from upstream"), &test_certs).await?;
+
+    // Create config for outbound proxy without client cert
+    let config = create_test_config(
+        upstream_port,
+        0,
+        monitor_port,
+        &test_certs,
+        false,
+        Some(outbound_proxy_port),
+        None, // No client cert dir
+    );
+    let config = Config {
+        upstream_url: format!("https://127.0.0.1:{}", upstream_port),
+        ..config
+    };
+    let config = Arc::new(config);
+
+    let tls_manager = Arc::new(TlsManager::new());
+    tls_manager.reload(&config).await?;
+
+    // Start outbound proxy listener
+    let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
+    let outbound_listener = TcpListener::bind(&outbound_addr).await?;
+    let tls_manager_outbound = Arc::clone(&tls_manager);
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = outbound_listener.accept().await.unwrap();
+            let tls_manager = Arc::clone(&tls_manager_outbound);
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    let tls_mgr = Arc::clone(&tls_manager);
+                    async move { mtls_sidecar::proxy_outbound::handler(req, &tls_mgr).await }
+                });
+                if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                {
+                    tracing::error!("Error serving outbound connection: {:?}", err);
+                }
+            });
+        }
+    });
+
+    // Wait for servers to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Make HTTP request to outbound proxy with target URI
+    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", outbound_proxy_port)).await?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    tokio::spawn(async move {
+        conn.await.unwrap();
+    });
+    let req = Request::get(format!("http://127.0.0.1:{}/", upstream_port))
+        .body(Full::new(Bytes::new()))?;
+    let result = sender.send_request(req).await;
+    // Should fail because no client cert configured
+    assert!(result.is_err());
+
+    Ok(())
+}
+
 fn validity_period() -> (OffsetDateTime, OffsetDateTime) {
-    let day = Duration::new(86400, 0);
-    let yesterday = OffsetDateTime::now_utc().checked_sub(day).unwrap();
-    let tomorrow = OffsetDateTime::now_utc().checked_add(day).unwrap();
-    (yesterday, tomorrow)
+    let now = OffsetDateTime::now_utc();
+    let past = now.checked_sub(Duration::hours(1)).unwrap();
+    let future = now.checked_add(Duration::hours(1)).unwrap();
+    (past, future)
 }
