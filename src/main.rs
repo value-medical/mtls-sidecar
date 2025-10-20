@@ -1,3 +1,6 @@
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use anyhow::{Context, Error, Result};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -7,7 +10,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 
@@ -77,86 +80,7 @@ async fn start_monitoring_server(
     Ok(())
 }
 
-async fn start_outbound_proxy(
-    outbound_port: u16,
-    tls_manager: Arc<TlsManager>,
-) -> Result<(), Error> {
-    let outbound_addr = format!("0.0.0.0:{}", outbound_port);
-    let outbound_listener = TcpListener::bind(&outbound_addr).await.context(format!(
-        "Failed to bind outbound proxy to {}",
-        outbound_addr
-    ))?;
-    tracing::info!("Outbound proxy listening on {}", outbound_addr);
 
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = outbound_listener.accept().await.unwrap();
-            let tls_manager = Arc::clone(&tls_manager);
-            tokio::spawn(async move {
-
-                // Create a new HTTP client with current TLS config for every connection;
-                // this ensures that we always use the latest certs, with pooling still
-                // effective for multiple requests over the same connection.
-                let client_config = tls_manager.client_config.read().await.clone().unwrap();
-                let https = hyper_rustls::HttpsConnectorBuilder::new()
-                    .with_tls_config((*client_config).clone())
-                    .https_only()
-                    .enable_http1()
-                    .enable_http2()
-                    .build();
-                let client: Arc<Client<HttpsConnector<HttpConnector>, Incoming>> =
-                    Arc::new(Client::builder(TokioExecutor::new()).build(https));
-
-                // Handle connection
-                let service = service_fn(move |req| {
-                    let client = Arc::clone(&client);
-                    async move { mtls_sidecar::proxy_outbound::handler(req, client).await }
-                });
-                if let Err(err) = auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                {
-                    tracing::error!("Error serving outbound connection: {:?}", err);
-                }
-            });
-        }
-    });
-    Ok(())
-}
-
-async fn start_inbound_proxy(
-    tls_listen_port: u16,
-    config: Arc<config::Config>,
-    tls_manager: Arc<TlsManager>,
-) -> Result<(), Error> {
-    let inbound_addr = format!("0.0.0.0:{}", tls_listen_port);
-    let listener = TcpListener::bind(&inbound_addr)
-        .await
-        .context(format!("Failed to bind to {}", inbound_addr))?;
-    tracing::info!("Inbound proxy listening on {}", inbound_addr);
-
-    let upstream_url = config.upstream_url.clone().ok_or(DomainError::Config(
-        "upstream_url must be set for inbound proxy".to_string(),
-    ))?;
-    let inject_headers = config.inject_client_headers;
-    let http_client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-    let active_connections = Arc::new(AtomicUsize::new(0));
-
-    let (sigterm, sigint) = setup_signals()?;
-    run_server_loop(
-        listener,
-        upstream_url,
-        inject_headers,
-        http_client,
-        tls_manager,
-        active_connections.clone(),
-        sigterm,
-        sigint,
-    )
-    .await?;
-    shutdown(active_connections).await;
-    Ok(())
-}
 
 fn setup_signals() -> Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal), Error> {
     let sigterm = signal(SignalKind::terminate()).context("Failed to register SIGTERM handler")?;
@@ -164,8 +88,35 @@ fn setup_signals() -> Result<(tokio::signal::unix::Signal, tokio::signal::unix::
     Ok((sigterm, sigint))
 }
 
-async fn handle_connection(
-    stream: tokio::net::TcpStream,
+async fn accept_outbound_connection(stream: TcpStream, tls_manager: Arc<TlsManager>) {
+    // Create a new HTTP client with current TLS config for every connection;
+    // this ensures that we always use the latest certs, with pooling still
+    // effective for multiple requests over the same connection.
+    let client_config = tls_manager.client_config.read().await.clone().unwrap();
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config((*client_config).clone())
+        .https_only()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    let client: Arc<Client<HttpsConnector<HttpConnector>, Incoming>> =
+        Arc::new(Client::builder(TokioExecutor::new()).build(https));
+
+    // Handle connection
+    let service = service_fn(move |req| {
+        let client = Arc::clone(&client);
+        async move { mtls_sidecar::proxy_outbound::handler(req, client).await }
+    });
+    if let Err(err) = auto::Builder::new(TokioExecutor::new())
+        .serve_connection(TokioIo::new(stream), service)
+        .await
+    {
+        tracing::error!("Error serving outbound connection: {:?}", err);
+    }
+}
+
+async fn accept_inbound_connection(
+    stream: TcpStream,
     tls_manager: Arc<TlsManager>,
     upstream_url: String,
     inject: bool,
@@ -211,16 +162,51 @@ async fn handle_connection(
     }
 }
 
-async fn run_server_loop(
-    listener: TcpListener,
-    upstream_url: String,
-    inject_headers: bool,
-    http_client: Arc<Client<HttpConnector, Incoming>>,
-    tls_manager: Arc<TlsManager>,
-    active_connections: Arc<AtomicUsize>,
-    mut sigterm: tokio::signal::unix::Signal,
-    mut sigint: tokio::signal::unix::Signal,
-) -> Result<(), Error> {
+fn maybe_accept(listener: &Option<TcpListener>) -> Pin<Box<dyn futures::Future<Output = io::Result<(TcpStream, SocketAddr)>> + '_>> {
+    match listener {
+        Some(l) => Box::pin(l.accept()),
+        None => Box::pin(futures::future::pending::<io::Result<(TcpStream, SocketAddr)>>()),
+    }
+}
+
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    setup_crypto_provider();
+    setup_tracing();
+    let config = load_config()?;
+    let tls_manager = create_tls_manager(&config).await?;
+    start_watcher(Arc::clone(&config), Arc::clone(&tls_manager)).await;
+    start_monitoring_server(Arc::clone(&config), Arc::clone(&tls_manager)).await?;
+    let active_connections = Arc::new(AtomicUsize::new(0));
+
+    let mut outbound_listener = None;
+    if let Some(outbound_port) = config.outbound_proxy_port {
+        let outbound_addr = format!("0.0.0.0:{}", outbound_port);
+        outbound_listener = Some(TcpListener::bind(&outbound_addr).await.context(format!(
+            "Failed to bind outbound proxy to {}",
+            outbound_addr
+        ))?);
+        tracing::info!("Outbound proxy listening on {}", outbound_addr);
+    }
+
+    let mut inbound_listener = None;
+    let upstream_url = config.upstream_url.clone();
+    let inject_headers = config.inject_client_headers;
+    let http_client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+    if let Some(inbound_port) = config.tls_listen_port {
+        let inbound_addr = format!("0.0.0.0:{}", inbound_port);
+        inbound_listener = Some(TcpListener::bind(&inbound_addr).await.context(format!(
+            "Failed to bind to {}", inbound_addr
+        ))?);
+        tracing::info!("Inbound proxy listening on {}", inbound_addr);
+        if upstream_url.is_none() {
+            return Err(DomainError::Config("upstream_url must be set for inbound proxy".to_string()).into());
+        }
+    }
+
+    let (mut sigterm, mut sigint) = setup_signals()?;
+
     loop {
         tokio::select! {
             _ = sigterm.recv() => {
@@ -231,44 +217,45 @@ async fn run_server_loop(
                 tracing::info!("Shutdown signal received (SIGINT)");
                 break;
             }
-            result = listener.accept() => {
+            result = maybe_accept(&outbound_listener), if outbound_listener.is_some() => {
                 match result {
                     Ok((stream, _)) => {
                         active_connections.fetch_add(1, Ordering::Relaxed);
                         let tls_mgr = Arc::clone(&tls_manager);
-                        let upstream = upstream_url.clone();
-                        let inject = inject_headers;
-                        let client = Arc::clone(&http_client);
-                        let counter = Arc::clone(&active_connections);
+                        let active_conn = Arc::clone(&active_connections);
                         tokio::spawn(async move {
-                            handle_connection(stream, tls_mgr, upstream, inject, client).await;
-                            counter.fetch_sub(1, Ordering::Relaxed);
+                            accept_outbound_connection(stream, tls_mgr).await;
+                            active_conn.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
                     Err(e) => {
-                        tracing::error!("Failed to accept connection: {:?}", e);
+                        tracing::error!("Failed to accept outbound connection: {:?}", e);
+                    }
+                }
+            }
+            result = maybe_accept(&inbound_listener), if inbound_listener.is_some() => {
+                match result {
+                    Ok((stream, _)) => {
+                        active_connections.fetch_add(1, Ordering::Relaxed);
+                        let tls_mgr = Arc::clone(&tls_manager);
+                        let upstream = upstream_url.clone().unwrap();
+                        let inject = inject_headers;
+                        let client = Arc::clone(&http_client);
+                        let active_conn = Arc::clone(&active_connections);
+                        tokio::spawn(async move {
+                            accept_inbound_connection(stream, tls_mgr, upstream, inject, client).await;
+                            active_conn.fetch_sub(1, Ordering::Relaxed);
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to accept inbound connection: {:?}", e);
                     }
                 }
             }
         }
     }
-    Ok(())
-}
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    setup_crypto_provider();
-    setup_tracing();
-    let config = load_config()?;
-    let tls_manager = create_tls_manager(&config).await?;
-    start_watcher(Arc::clone(&config), Arc::clone(&tls_manager)).await;
-    start_monitoring_server(Arc::clone(&config), Arc::clone(&tls_manager)).await?;
-    if let Some(outbound_port) = config.outbound_proxy_port {
-        start_outbound_proxy(outbound_port, Arc::clone(&tls_manager)).await?;
-    }
-    if let Some(inbound_port) = config.tls_listen_port {
-        start_inbound_proxy(inbound_port, Arc::clone(&config), Arc::clone(&tls_manager)).await?;
-    }
+    shutdown(active_connections).await;
     Ok(())
 }
 
