@@ -1,5 +1,5 @@
 use crate::error::DomainError;
-use anyhow::{Result, Error};
+use anyhow::{Error, Result};
 use hyper::Uri;
 use std::collections::HashMap;
 use std::env;
@@ -8,20 +8,148 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub tls_listen_port: Option<u16>,
-    pub upstream_url: String,
+    pub upstream_url: Option<String>,
     pub ca_dir: Option<PathBuf>,
     pub server_cert_dir: Option<PathBuf>,
     pub client_cert_dir: Option<PathBuf>,
     pub inject_client_headers: bool,
-    pub upstream_readiness_url: String,
+    pub upstream_readiness_url: Option<String>,
     pub outbound_proxy_port: Option<u16>,
     pub monitor_port: u16,
     pub enable_metrics: bool,
+}
+#[derive(Default)]
+struct ConfigBuilder {
+    tls_listen_port: Option<u16>,
+    upstream_url: Option<String>,
+    ca_dir: Option<PathBuf>,
+    server_cert_dir: Option<PathBuf>,
+    client_cert_dir: Option<PathBuf>,
+    inject_client_headers: Option<bool>,
+    upstream_readiness_url: Option<String>,
+    outbound_proxy_port: Option<u16>,
+    monitor_port: Option<u16>,
+    enable_metrics: Option<bool>,
+}
+
+impl ConfigBuilder {
+    fn tls_listen_port(mut self, val: Option<u16>) -> Self {
+        self.tls_listen_port = val;
+        self
+    }
+
+    fn upstream_url(mut self, val: String) -> Self {
+        self.upstream_url = Some(val);
+        self
+    }
+
+    fn ca_dir(mut self, val: Option<PathBuf>) -> Self {
+        self.ca_dir = val;
+        self
+    }
+
+    fn server_cert_dir(mut self, val: Option<PathBuf>) -> Self {
+        self.server_cert_dir = val;
+        self
+    }
+
+    fn client_cert_dir(mut self, val: Option<PathBuf>) -> Self {
+        self.client_cert_dir = val;
+        self
+    }
+
+    fn inject_client_headers(mut self, val: bool) -> Self {
+        self.inject_client_headers = Some(val);
+        self
+    }
+
+    fn upstream_readiness_url(mut self, val: String) -> Self {
+        self.upstream_readiness_url = Some(val);
+        self
+    }
+
+    fn outbound_proxy_port(mut self, val: Option<u16>) -> Self {
+        self.outbound_proxy_port = val;
+        self
+    }
+
+    fn monitor_port(mut self, val: u16) -> Self {
+        self.monitor_port = Some(val);
+        self
+    }
+
+    fn enable_metrics(mut self, val: bool) -> Self {
+        self.enable_metrics = Some(val);
+        self
+    }
+
+    fn build(self) -> Result<Config, Error> {
+        Ok(Config {
+            tls_listen_port: self.tls_listen_port,
+            upstream_url: self.upstream_url,
+            ca_dir: self.ca_dir,
+            server_cert_dir: self.server_cert_dir,
+            client_cert_dir: self.client_cert_dir,
+            inject_client_headers: self.inject_client_headers.unwrap_or(false),
+            upstream_readiness_url: self.upstream_readiness_url,
+            outbound_proxy_port: self.outbound_proxy_port,
+            monitor_port: self.monitor_port.unwrap(),
+            enable_metrics: self.enable_metrics.unwrap(),
+        })
+    }
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, Error> {
         Self::from_env_map(None)
+    }
+    fn parse_optional_port(s: &str, name: &str) -> Result<Option<u16>> {
+        if s.is_empty() {
+            return Ok(None);
+        }
+        let port: u16 = s
+            .parse()
+            .map_err(|_| DomainError::Config(format!("Invalid {}: {}", name, s)))?;
+        if port == 0 {
+            return Err(DomainError::Config(format!("{} cannot be 0", name)).into());
+        }
+        Ok(Some(port))
+    }
+
+    fn parse_monitor_port(s: &str) -> Result<u16> {
+        let port: u16 = s
+            .parse()
+            .map_err(|_| DomainError::Config(format!("Invalid MONITOR_PORT: {}", s)))?;
+        if port == 0 {
+            tracing::warn!("MONITOR_PORT is 0, monitoring server will be disabled");
+        }
+        Ok(port)
+    }
+
+    fn parse_bool(s: &str, name: &str) -> Result<bool> {
+        s.parse()
+            .map_err(|_| DomainError::Config(format!("Invalid {}: {}", name, s)).into())
+    }
+
+    fn parse_uri(s: &str, name: &str) -> Result<String> {
+        let uri: Uri = s
+            .parse()
+            .map_err(|_| DomainError::Config(format!("Invalid {}: {}", name, s)))?;
+        if uri.scheme_str() != Some("http") {
+            return Err(DomainError::Config(format!("{} must be HTTP", name)).into());
+        }
+        Ok(s.to_string())
+    }
+
+    fn parse_optional_path(s: &str, name: &str) -> Option<PathBuf> {
+        if s.is_empty() {
+            return None;
+        }
+        let path = Path::new(s);
+        if !path.exists() {
+            tracing::warn!("{} does not exist: {}", name, s);
+        }
+        Some(path.to_path_buf())
     }
 
     fn from_env_map(env_map: Option<&HashMap<String, String>>) -> Result<Self, Error> {
@@ -46,128 +174,40 @@ impl Config {
             })
         };
 
-        // Validate TLS_LISTEN_PORT
-        let tls_listen_port_str = get_var("TLS_LISTEN_PORT");
-        let tls_listen_port: Option<u16> = if tls_listen_port_str.is_empty() {
-            None
-        } else {
-            let port: u16 = tls_listen_port_str
-                .parse()
-                .map_err(|_| DomainError::Config(format!("Invalid TLS_LISTEN_PORT: {}", tls_listen_port_str)))?;
-            if port == 0 {
-                return Err(DomainError::Config("TLS_LISTEN_PORT cannot be 0".to_string()).into());
-            }
-            Some(port)
-        };
-
-        // Validate UPSTREAM_URL
-        let upstream_url_str = get_var("UPSTREAM_URL");
-        let upstream_uri: Uri = upstream_url_str
-            .parse()
-            .map_err(|_| DomainError::Config(format!("Invalid UPSTREAM_URL: {}", upstream_url_str)))?;
-        if upstream_uri.scheme_str() != Some("http") {
-            return Err(DomainError::Config("UPSTREAM_URL must be HTTP".to_string()).into());
-        }
-
-        // Validate CA_DIR
-        let ca_dir_str = get_var("CA_DIR");
-        let ca_dir = if ca_dir_str.is_empty() {
-            None
-        } else {
-            let ca_dir_path = Path::new(&ca_dir_str);
-            if !ca_dir_path.exists() {
-                tracing::warn!("CA_DIR does not exist: {}", ca_dir_str);
-            }
-            Some(ca_dir_path.to_path_buf())
-        };
-
-        // Validate SERVER_CERT_DIR
-        let server_cert_dir_str = get_var("SERVER_CERT_DIR");
-        let server_cert_dir = if server_cert_dir_str.is_empty() {
-            None
-        } else {
-            let server_cert_dir_path = Path::new(&server_cert_dir_str);
-            if !server_cert_dir_path.exists() {
-                tracing::warn!("SERVER_CERT_DIR does not exist: {}", server_cert_dir_str);
-            }
-            Some(server_cert_dir_path.to_path_buf())
-        };
-
-        // Validate CLIENT_CERT_DIR
-        let client_cert_dir_str = get_var("CLIENT_CERT_DIR");
-        let client_cert_dir = if client_cert_dir_str.is_empty() {
-            None
-        } else {
-            let client_cert_dir_path = Path::new(&client_cert_dir_str);
-            if !client_cert_dir_path.exists() {
-                tracing::warn!("CLIENT_CERT_DIR does not exist: {}", client_cert_dir_str);
-            }
-            Some(client_cert_dir_path.to_path_buf())
-        };
-
-        // Validate INJECT_CLIENT_HEADERS
-        let inject_client_headers_str = get_var("INJECT_CLIENT_HEADERS");
-        let inject_client_headers: bool = inject_client_headers_str.parse().map_err(|_| {
-            DomainError::Config(format!(
-                "Invalid INJECT_CLIENT_HEADERS: {}",
-                inject_client_headers_str
+        let builder = ConfigBuilder::default()
+            .tls_listen_port(Self::parse_optional_port(
+                &get_var("TLS_LISTEN_PORT"),
+                "TLS_LISTEN_PORT",
+            )?)
+            .upstream_url(Self::parse_uri(&get_var("UPSTREAM_URL"), "UPSTREAM_URL")?)
+            .ca_dir(Self::parse_optional_path(&get_var("CA_DIR"), "CA_DIR"))
+            .server_cert_dir(Self::parse_optional_path(
+                &get_var("SERVER_CERT_DIR"),
+                "SERVER_CERT_DIR",
             ))
-        })?;
-
-        // Validate UPSTREAM_READINESS_URL
-        let upstream_readiness_url_str = get_var("UPSTREAM_READINESS_URL");
-        let upstream_readiness_uri: Uri = upstream_readiness_url_str.parse().map_err(|_| {
-            DomainError::Config(format!(
-                "Invalid UPSTREAM_READINESS_URL: {}",
-                upstream_readiness_url_str
+            .client_cert_dir(Self::parse_optional_path(
+                &get_var("CLIENT_CERT_DIR"),
+                "CLIENT_CERT_DIR",
             ))
-        })?;
-        if upstream_readiness_uri.scheme_str() != Some("http") {
-            return Err(DomainError::Config("UPSTREAM_READINESS_URL must be HTTP".to_string()).into());
-        }
+            .inject_client_headers(Self::parse_bool(
+                &get_var("INJECT_CLIENT_HEADERS"),
+                "INJECT_CLIENT_HEADERS",
+            )?)
+            .upstream_readiness_url(Self::parse_uri(
+                &get_var("UPSTREAM_READINESS_URL"),
+                "UPSTREAM_READINESS_URL",
+            )?)
+            .outbound_proxy_port(Self::parse_optional_port(
+                &get_var("OUTBOUND_PROXY_PORT"),
+                "OUTBOUND_PROXY_PORT",
+            )?)
+            .monitor_port(Self::parse_monitor_port(&get_var("MONITOR_PORT"))?)
+            .enable_metrics(Self::parse_bool(
+                &get_var("ENABLE_METRICS"),
+                "ENABLE_METRICS",
+            )?);
 
-        // Validate OUTBOUND_PROXY_PORT
-        let outbound_proxy_port_str = get_var("OUTBOUND_PROXY_PORT");
-        let outbound_proxy_port: Option<u16> = if outbound_proxy_port_str.is_empty() {
-            None
-        } else {
-            let port: u16 = outbound_proxy_port_str
-                .parse()
-                .map_err(|_| DomainError::Config(format!("Invalid OUTBOUND_PROXY_PORT: {}", outbound_proxy_port_str)))?;
-            if port == 0 {
-                return Err(DomainError::Config("OUTBOUND_PROXY_PORT cannot be 0".to_string()).into());
-            }
-            Some(port)
-        };
-
-
-        // Validate MONITOR_PORT
-        let monitor_port_str = get_var("MONITOR_PORT");
-        let monitor_port: u16 = monitor_port_str
-            .parse()
-            .map_err(|_| DomainError::Config(format!("Invalid MONITOR_PORT: {}", monitor_port_str)))?;
-        if monitor_port == 0 {
-            tracing::warn!("MONITOR_PORT is 0, monitoring server will be disabled");
-        }
-
-        // Validate ENABLE_METRICS
-        let enable_metrics_str = get_var("ENABLE_METRICS");
-        let enable_metrics: bool = enable_metrics_str
-            .parse()
-            .map_err(|_| DomainError::Config(format!("Invalid ENABLE_METRICS: {}", enable_metrics_str)))?;
-
-        Ok(Config {
-            tls_listen_port,
-            ca_dir,
-            server_cert_dir,
-            client_cert_dir,
-            upstream_url: upstream_url_str,
-            upstream_readiness_url: upstream_readiness_url_str,
-            inject_client_headers,
-            outbound_proxy_port,
-            monitor_port,
-            enable_metrics,
-        })
+        builder.build()
     }
 }
 
@@ -180,12 +220,18 @@ mod tests {
         let env_map = HashMap::new();
         let config = Config::from_env_map(Some(&env_map)).unwrap();
         assert_eq!(config.tls_listen_port, Some(8443));
-        assert_eq!(config.upstream_url, "http://localhost:8080");
+        assert_eq!(config.upstream_url, Some("http://localhost:8080".to_string()));
         assert_eq!(config.ca_dir.unwrap().to_str().unwrap(), "/etc/ca");
-        assert_eq!(config.server_cert_dir.unwrap().to_str().unwrap(), "/etc/certs");
-        assert_eq!(config.client_cert_dir.unwrap().to_str().unwrap(), "/etc/client-certs");
+        assert_eq!(
+            config.server_cert_dir.unwrap().to_str().unwrap(),
+            "/etc/certs"
+        );
+        assert_eq!(
+            config.client_cert_dir.unwrap().to_str().unwrap(),
+            "/etc/client-certs"
+        );
         assert_eq!(config.inject_client_headers, false);
-        assert_eq!(config.upstream_readiness_url, "http://localhost:8080/ready");
+        assert_eq!(config.upstream_readiness_url, Some("http://localhost:8080/ready".to_string()));
         assert_eq!(config.outbound_proxy_port, None);
         assert_eq!(config.monitor_port, 8081);
         assert_eq!(config.enable_metrics, false);
@@ -209,14 +255,20 @@ mod tests {
 
         let config = Config::from_env_map(Some(&env_map)).unwrap();
         assert_eq!(config.tls_listen_port, Some(9443));
-        assert_eq!(config.upstream_url, "http://example.com:9090");
+        assert_eq!(config.upstream_url, Some("http://example.com:9090".to_string()));
         assert_eq!(config.ca_dir.unwrap().to_str().unwrap(), "/custom/ca");
-        assert_eq!(config.server_cert_dir.unwrap().to_str().unwrap(), "/custom/certs");
-        assert_eq!(config.client_cert_dir.unwrap().to_str().unwrap(), "/etc/client-certs");
+        assert_eq!(
+            config.server_cert_dir.unwrap().to_str().unwrap(),
+            "/custom/certs"
+        );
+        assert_eq!(
+            config.client_cert_dir.unwrap().to_str().unwrap(),
+            "/etc/client-certs"
+        );
         assert_eq!(config.inject_client_headers, true);
         assert_eq!(
             config.upstream_readiness_url,
-            "http://example.com:9090/health"
+            Some("http://example.com:9090/health".to_string())
         );
         assert_eq!(config.outbound_proxy_port, None);
         assert_eq!(config.monitor_port, 8081);

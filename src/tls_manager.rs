@@ -8,12 +8,13 @@ use chrono::{DateTime, Utc};
 use log::error;
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use rustls_pki_types::{pem::PemObject, PrivateKeyDer};
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::fs;
 use tokio::sync::RwLock;
 use x509_parser::parse_x509_certificate;
 
 pub struct TlsManager {
+    pub ca_certs: RwLock<Arc<Vec<CertificateDer<'static>>>>,
     pub server_config: RwLock<Option<Arc<ServerConfig>>>,
     pub server_required: bool,
     pub client_config: RwLock<Option<Arc<ClientConfig>>>,
@@ -24,6 +25,7 @@ pub struct TlsManager {
 impl TlsManager {
     pub fn new() -> Self {
         TlsManager {
+            ca_certs: RwLock::new(Arc::new(Vec::new())),
             server_config: RwLock::new(None),
             server_required: true,
             client_config: RwLock::new(None),
@@ -41,16 +43,25 @@ impl TlsManager {
     }
 
     pub async fn reload(&self, config: &Config) -> Result<(), Error> {
-        // Load CA certs, server cert/key, client cert/key
+        *self.earliest_expiry.write().await = None;
         let ca_certs = Self::load_ca_certs(
             &config.ca_dir,
             &config.server_cert_dir,
             &config.client_cert_dir,
         )
         .await?;
+        self.update_earliest_expiry(&ca_certs).await;
+        *self.ca_certs.write().await = Arc::new(ca_certs);
 
+        self.reload_server_config(&config.server_cert_dir).await?;
+        self.reload_client_config(&config.client_cert_dir).await?;
+
+        Ok(())
+    }
+
+    pub async fn reload_server_config(&self, cert_dir: &Option<PathBuf>) -> Result<(), Error> {
         let server_cert_key_opt = if self.server_required {
-            if let Some(server_cert_dir) = &config.server_cert_dir {
+            if let Some(server_cert_dir) = &cert_dir {
                 Self::load_server_cert_and_key(server_cert_dir).await?
             } else {
                 return Err(anyhow::anyhow!(
@@ -60,9 +71,22 @@ impl TlsManager {
         } else {
             None
         };
+        let mut server_config: Option<Arc<ServerConfig>> = None;
+        if let Some((certs, key)) = server_cert_key_opt {
+            self.update_earliest_expiry(&certs).await;
+            server_config = Some(Arc::new(Self::build_server_config(
+                certs.clone(),
+                key,
+                self.ca_certs.read().await.as_ref().to_vec(),
+            )?));
+        }
+        *self.server_config.write().await = server_config;
+        Ok(())
+    }
 
+    pub async fn reload_client_config(&self, cert_dir: &Option<PathBuf>) -> Result<(), Error> {
         let client_cert_key_opt = if self.client_required {
-            if let Some(client_cert_dir) = &config.client_cert_dir {
+            if let Some(client_cert_dir) = &cert_dir {
                 Self::load_client_cert_and_key(client_cert_dir).await?
             } else {
                 return Err(anyhow::anyhow!(
@@ -72,40 +96,16 @@ impl TlsManager {
         } else {
             None
         };
-
-        // Compute and update earliest expiry
-        let mut earliest_expiry: Option<DateTime<Utc>> = None;
-        Self::update_earliest_expiry(&mut earliest_expiry, &ca_certs);
-        if let Some((certs, _)) = &server_cert_key_opt {
-            Self::update_earliest_expiry(&mut earliest_expiry, &certs);
-        }
-        if let Some((certs, _)) = &client_cert_key_opt {
-            Self::update_earliest_expiry(&mut earliest_expiry, &certs);
-        }
-        *self.earliest_expiry.write().await = earliest_expiry;
-
-        // Update server config
-        let mut server_config: Option<Arc<ServerConfig>> = None;
-        if let Some((certs, key)) = server_cert_key_opt {
-            server_config = Some(Arc::new(Self::build_server_config(
-                certs.clone(),
-                key,
-                ca_certs.clone(),
-            )?));
-        }
-        *self.server_config.write().await = server_config;
-
-        // Update client config
         let mut client_config: Option<Arc<ClientConfig>> = None;
         if let Some((certs, key)) = client_cert_key_opt {
+            self.update_earliest_expiry(&certs).await;
             client_config = Some(Arc::new(Self::build_client_config(
                 certs.clone(),
                 key,
-                ca_certs.clone(),
+                self.ca_certs.read().await.as_ref().to_vec(),
             )?));
         }
         *self.client_config.write().await = client_config;
-
         Ok(())
     }
 
@@ -266,10 +266,11 @@ impl TlsManager {
         Some((cert_path, key_path))
     }
 
-    fn update_earliest_expiry(
-        earliest: &mut Option<DateTime<Utc>>,
+    async fn update_earliest_expiry(
+        &self,
         certs: &[rustls::pki_types::CertificateDer<'static>],
     ) {
+        let earliest = *self.earliest_expiry.read().await;
         for cert_der in certs {
             match parse_x509_certificate(cert_der) {
                 Ok((_, cert)) => {
@@ -279,12 +280,12 @@ impl TlsManager {
                         .unwrap_or_else(|| Utc::now()); // fallback if conversion fails
                     match earliest {
                         Some(current_earliest) => {
-                            if expiry < *current_earliest {
-                                *earliest = Some(expiry);
+                            if expiry < current_earliest {
+                                *self.earliest_expiry.write().await = Some(expiry);
                             }
                         }
                         None => {
-                            *earliest = Some(expiry);
+                            *self.earliest_expiry.write().await = Some(expiry);
                         }
                     }
                 }
@@ -370,8 +371,8 @@ mod tests {
     fn new_config() -> Config {
         Config {
             tls_listen_port: Some(8443),
-            upstream_url: "http://localhost:8080".to_string(),
-            upstream_readiness_url: "http://localhost:8080/ready".to_string(),
+            upstream_url: Some("http://localhost:8080".to_string()),
+            upstream_readiness_url: Some("http://localhost:8080/ready".to_string()),
             ca_dir: None,
             server_cert_dir: None,
             client_cert_dir: None,
@@ -526,8 +527,8 @@ mod tests {
 
         let config = Config {
             tls_listen_port: Some(8443),
-            upstream_url: "http://localhost:8080".to_string(),
-            upstream_readiness_url: "http://localhost:8080/ready".to_string(),
+            upstream_url: Some("http://localhost:8080".to_string()),
+            upstream_readiness_url: Some("http://localhost:8080/ready".to_string()),
             ca_dir: Some(ca_dir.clone()),
             server_cert_dir: Some(cert_dir.clone()),
             client_cert_dir: None,

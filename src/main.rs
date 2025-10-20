@@ -11,7 +11,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 
 use mtls_sidecar::{config, monitoring, proxy_inbound, tls_manager, watcher};
-
+use mtls_sidecar::error::DomainError;
 use tls_manager::TlsManager;
 
 fn setup_crypto_provider() {
@@ -111,6 +111,40 @@ async fn start_outbound_proxy(
             });
         }
     });
+    Ok(())
+}
+
+async fn start_inbound_proxy(
+    tls_listen_port: u16,
+    config: Arc<config::Config>,
+    tls_manager: Arc<TlsManager>,
+) -> Result<(), Error> {
+    let inbound_addr = format!("0.0.0.0:{}", tls_listen_port);
+    let listener = TcpListener::bind(&inbound_addr)
+        .await
+        .context(format!("Failed to bind to {}", inbound_addr))?;
+    tracing::info!("Inbound proxy listening on {}", inbound_addr);
+
+    let upstream_url = config.upstream_url.clone().ok_or(DomainError::Config(
+        "upstream_url must be set for inbound proxy".to_string(),
+    ))?;
+    let inject_headers = config.inject_client_headers;
+    let http_client = create_http_client();
+    let active_connections = Arc::new(AtomicUsize::new(0));
+
+    let (sigterm, sigint) = setup_signals()?;
+    run_server_loop(
+        listener,
+        upstream_url,
+        inject_headers,
+        http_client,
+        tls_manager,
+        active_connections.clone(),
+        sigterm,
+        sigint,
+    )
+        .await?;
+    shutdown(active_connections).await;
     Ok(())
 }
 
@@ -217,39 +251,18 @@ async fn main() -> Result<(), Error> {
     setup_tracing();
     let config = load_config()?;
     let tls_manager = create_tls_manager(&config).await?;
-    let client = create_http_client();
     start_watcher(Arc::clone(&config), Arc::clone(&tls_manager)).await;
     start_monitoring_server(Arc::clone(&config), Arc::clone(&tls_manager)).await?;
     if let Some(outbound_port) = config.outbound_proxy_port {
         start_outbound_proxy(outbound_port, Arc::clone(&tls_manager)).await?;
     }
-
-    // Bind to configured port
-    let tls_listen_port = config.tls_listen_port.unwrap_or(8443);
-    let addr = format!("0.0.0.0:{}", tls_listen_port);
-    let listener = TcpListener::bind(&addr)
-        .await
-        .context(format!("Failed to bind to {}", addr))?;
-
-    let upstream_url = config.upstream_url.clone();
-    let inject_headers = config.inject_client_headers;
-    let http_client = Arc::clone(&client);
-    let active_connections = Arc::new(AtomicUsize::new(0));
-
-    let (sigterm, sigint) = setup_signals()?;
-    run_server_loop(
-        listener,
-        upstream_url,
-        inject_headers,
-        http_client,
-        tls_manager,
-        active_connections.clone(),
-        sigterm,
-        sigint,
-    )
-    .await?;
-    shutdown(active_connections).await;
-
+    if let Some(inbound_port) = config.tls_listen_port {
+        start_inbound_proxy(
+            inbound_port,
+            Arc::clone(&config),
+            Arc::clone(&tls_manager),
+        ).await?;
+    }
     Ok(())
 }
 

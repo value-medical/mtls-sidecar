@@ -63,7 +63,7 @@ async fn check_certificate_expiry(tls_manager: &TlsManager) -> Result<(), ()> {
 
 async fn ready_handler(
     req: Request<AxumBody>,
-    readiness_url: String,
+    readiness_url_opt: Option<String>,
     tls_manager: Arc<TlsManager>,
 ) -> Result<&'static str, StatusCode> {
     tracing::info!("Readiness probe called");
@@ -73,26 +73,28 @@ async fn ready_handler(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    let client = Client::builder(TokioExecutor::new()).build_http();
+    if let Some(readiness_url) = readiness_url_opt {
+        let client = Client::builder(TokioExecutor::new()).build_http();
 
-    let mut builder = hyper::Request::get(&readiness_url);
-    for (key, value) in req.headers() {
-        builder = builder.header(key, value);
+        let mut builder = hyper::Request::get(&readiness_url);
+        for (key, value) in req.headers() {
+            builder = builder.header(key, value);
+        }
+        let request = builder
+            .body(Empty::<Bytes>::new())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let response = tokio::time::timeout(Duration::from_secs(1), client.request(request))
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+        if !response.status().is_success() {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
-    let request = builder
-        .body(Empty::<Bytes>::new())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let response = tokio::time::timeout(Duration::from_secs(1), client.request(request))
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-
-    if response.status().is_success() {
-        Ok("OK")
-    } else {
-        Err(StatusCode::SERVICE_UNAVAILABLE)
-    }
+    Ok("OK")
 }
 
 async fn metrics_handler() -> Result<String, StatusCode> {
@@ -144,8 +146,8 @@ mod tests {
         let _router = create_router(
             Arc::new(Config {
                 tls_listen_port: Some(8443),
-                upstream_url: "http://localhost:8080".to_string(),
-                upstream_readiness_url: "http://localhost:8080/ready".to_string(),
+                upstream_url: Some("http://localhost:8080".to_string()),
+                upstream_readiness_url: Some("http://localhost:8080/ready".to_string()),
                 ca_dir: Some(PathBuf::from("/etc/ca")),
                 server_cert_dir: Some(PathBuf::from("/etc/certs")),
                 client_cert_dir: Some(PathBuf::from("/etc/client-certs")),
@@ -198,7 +200,7 @@ mod tests {
         let req = Request::get("/ready").body(Body::empty()).unwrap();
         let result = ready_handler(
             req,
-            format!("http://127.0.0.1:{}/ready", upstream_port).to_string(),
+            Some(format!("http://127.0.0.1:{}/ready", upstream_port).to_string()),
             tls_manager,
         )
         .await;
@@ -225,7 +227,7 @@ mod tests {
 
         let req = Request::get("/ready").body(Body::empty()).unwrap();
         let result =
-            ready_handler(req, "http://127.0.0.1:9999/ready".to_string(), tls_manager).await;
+            ready_handler(req, Some("http://127.0.0.1:9999/ready".to_string()), tls_manager).await;
         assert_eq!(result, Err(StatusCode::SERVICE_UNAVAILABLE));
     }
 

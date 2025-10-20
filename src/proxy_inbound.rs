@@ -37,8 +37,9 @@ where
             .body(bad_request_body)?);
     }
 
-    // Extract client cert from extensions
+    // Require client cert
     if client_cert.is_none() {
+        tracing::warn!("Missing client certificate");
         // No cert, return 401
         MTLS_FAILURES_TOTAL.inc();
         let unauthorized_full =

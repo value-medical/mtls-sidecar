@@ -21,7 +21,7 @@ use time::OffsetDateTime;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
-
+use x509_parser::nom::AsBytes;
 use mtls_sidecar::config::Config;
 use mtls_sidecar::tls_manager::TlsManager;
 
@@ -52,8 +52,8 @@ impl Greeter for MyGreeter {
 
 struct TestCerts {
     _temp_dir: TempDir,
-    cert_dir: std::path::PathBuf,
-    ca_dir: std::path::PathBuf,
+    cert_dir: PathBuf,
+    ca_dir: PathBuf,
     ca_cert: rcgen::Certificate,
     client_cert: rcgen::Certificate,
     client_key: KeyPair,
@@ -151,8 +151,8 @@ fn create_test_config(
 ) -> Config {
     Config {
         tls_listen_port: Some(sidecar_port),
-        upstream_url: format!("http://127.0.0.1:{}", upstream_port),
-        upstream_readiness_url: format!("http://127.0.0.1:{}/ready", upstream_port),
+        upstream_url: Some(format!("http://127.0.0.1:{}", upstream_port)),
+        upstream_readiness_url: Some(format!("http://127.0.0.1:{}/ready", upstream_port)),
         ca_dir: Some(test_certs.ca_dir.clone()),
         server_cert_dir: Some(test_certs.cert_dir.clone()),
         client_cert_dir,
@@ -176,7 +176,7 @@ async fn setup_test(
 ) -> Result<(
     TestSetup,
     Arc<TlsManager>,
-    Arc<mtls_sidecar::config::Config>,
+    Arc<Config>,
 )> {
     let (upstream_port, sidecar_port, monitor_port) = pick_ports();
     let config = Arc::new(create_test_config(
@@ -292,15 +292,15 @@ async fn start_readiness_upstream(port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn start_https_upstream(port: u16, response: Bytes, test_certs: &TestCerts) -> Result<()> {
+async fn start_https_upstream(port: u16, response: Bytes, cert_dir: &PathBuf) -> Result<()> {
     let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     let tls_manager = Arc::new(TlsManager::new());
     let config = Config {
         tls_listen_port: Some(port),
-        upstream_url: "dummy".to_string(),
-        upstream_readiness_url: "dummy".to_string(),
+        upstream_url: None,
+        upstream_readiness_url: None,
         ca_dir: None, // Do not require client cert for simplicity
-        server_cert_dir: Some(test_certs.cert_dir.clone()),
+        server_cert_dir: Some(cert_dir.clone()),
         client_cert_dir: None,
         inject_client_headers: false,
         outbound_proxy_port: None,
@@ -313,14 +313,14 @@ async fn start_https_upstream(port: u16, response: Bytes, test_certs: &TestCerts
         loop {
             let (stream, _) = upstream_listener.accept().await.unwrap();
             let tls_manager = Arc::clone(&tls_manager);
-            let r = resp.clone();
+            let resp = resp.clone();
             tokio::spawn(async move {
                 let current_config = tls_manager.server_config.read().await.clone().unwrap();
                 let acceptor = TlsAcceptor::from(current_config);
                 let stream = acceptor.accept(stream).await.unwrap();
                 let service = service_fn(move |_req| {
-                    let r = r.clone();
-                    async move { Ok::<_, hyper::Error>(Response::new(Full::new(r))) }
+                    let resp = resp.clone();
+                    async move { Ok::<_, hyper::Error>(Response::new(Full::new(resp))) }
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -333,12 +333,12 @@ async fn start_https_upstream(port: u16, response: Bytes, test_certs: &TestCerts
 }
 
 async fn start_sidecar(
-    config: &mtls_sidecar::config::Config,
+    config: &Config,
     tls_manager: Arc<TlsManager>,
 ) -> Result<()> {
     let sidecar_listener =
         TcpListener::bind(format!("127.0.0.1:{}", config.tls_listen_port.unwrap())).await?;
-    let upstream_url = config.upstream_url.clone();
+    let upstream_url = config.upstream_url.clone().unwrap();
     let inject = config.inject_client_headers;
     tokio::spawn(async move {
         loop {
@@ -376,7 +376,7 @@ async fn start_sidecar(
 
 fn create_client_builder_with_cert(test_certs: &TestCerts) -> Result<reqwest::ClientBuilder> {
     let builder = reqwest::Client::builder()
-        .add_root_certificate(Certificate::from_pem(test_certs.ca_cert.pem().as_bytes())?)
+        .add_root_certificate(Certificate::from_der(test_certs.ca_cert.der().as_bytes())?)
         .identity(reqwest::Identity::from_pem(
             format!(
                 "{}{}",
@@ -551,11 +551,11 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
         None,
         None,
     );
-    config.upstream_url = format!("http://127.0.0.1:{}/grpc", upstream_port);
+    let upstream_url = format!("http://127.0.0.1:{}/grpc", upstream_port);
+    config.upstream_url = Some(upstream_url.clone());
     let tls_manager = Arc::new(TlsManager::new());
     tls_manager.reload(&config).await?;
     let sidecar_listener = TcpListener::bind(format!("127.0.0.1:{}", sidecar_port)).await?;
-    let upstream_url = config.upstream_url.clone();
     tokio::spawn(async move {
         loop {
             let (stream, _) = sidecar_listener.accept().await.unwrap();
@@ -894,7 +894,7 @@ async fn test_outbound_proxy_with_valid_certs() -> Result<()> {
     let test_certs = setup_certificates()?;
 
     // Start HTTPS upstream server requiring client certs
-    start_https_upstream(upstream_port, Bytes::from("Hello from HTTPS upstream"), &test_certs).await?;
+    start_https_upstream(upstream_port, Bytes::from("Hello from HTTPS upstream"), &test_certs.cert_dir).await?;
 
     // Create client cert dir
     let client_cert_dir = test_certs._temp_dir.path().join("client-certs");
@@ -915,7 +915,7 @@ async fn test_outbound_proxy_with_valid_certs() -> Result<()> {
 
     // Override upstream_url to HTTPS
     let config = Config {
-        upstream_url: format!("https://127.0.0.1:{}", upstream_port),
+        upstream_url: Some(format!("https://127.0.0.1:{}", upstream_port)),
         ..config
     };
     let config = Arc::new(config);
@@ -986,7 +986,7 @@ async fn test_outbound_proxy_with_invalid_server_cert() -> Result<()> {
     std::fs::write(bad_cert_dir.join("tls.key"), bad_server_key.serialize_pem())?;
 
     // Start HTTPS upstream with bad cert
-    start_https_upstream_with_cert_dir(upstream_port, Bytes::from("Hello from bad upstream"), &bad_cert_dir).await?;
+    start_https_upstream(upstream_port, Bytes::from("Hello from bad upstream"), &bad_cert_dir).await?;
 
     // Create client cert dir
     let client_cert_dir = test_certs._temp_dir.path().join("client-certs");
@@ -1005,7 +1005,7 @@ async fn test_outbound_proxy_with_invalid_server_cert() -> Result<()> {
         Some(client_cert_dir),
     );
     let config = Config {
-        upstream_url: format!("https://127.0.0.1:{}", upstream_port),
+        upstream_url: Some(format!("https://127.0.0.1:{}", upstream_port)),
         ..config
     };
     let config = Arc::new(config);
@@ -1054,46 +1054,6 @@ async fn test_outbound_proxy_with_invalid_server_cert() -> Result<()> {
     Ok(())
 }
 
-async fn start_https_upstream_with_cert_dir(port: u16, response: Bytes, cert_dir: &std::path::Path) -> Result<()> {
-    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-    let tls_manager = Arc::new(TlsManager::new());
-    let config = Config {
-        tls_listen_port: Some(port),
-        upstream_url: "dummy".to_string(),
-        upstream_readiness_url: "dummy".to_string(),
-        ca_dir: None,
-        server_cert_dir: Some(cert_dir.to_path_buf()),
-        client_cert_dir: None,
-        inject_client_headers: false,
-        outbound_proxy_port: None,
-        monitor_port: 8081,
-        enable_metrics: false,
-    };
-    tls_manager.reload(&config).await?;
-    let resp = response;
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = upstream_listener.accept().await.unwrap();
-            let tls_manager = Arc::clone(&tls_manager);
-            let r = resp.clone();
-            tokio::spawn(async move {
-                let current_config = tls_manager.server_config.read().await.clone().unwrap();
-                let acceptor = TlsAcceptor::from(current_config);
-                let stream = acceptor.accept(stream).await.unwrap();
-                let service = service_fn(move |_req| {
-                    let r = r.clone();
-                    async move { Ok::<_, hyper::Error>(Response::new(Full::new(r))) }
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
-        }
-    });
-    Ok(())
-}
-
 #[tokio::test]
 async fn test_outbound_proxy_with_missing_client_cert() -> Result<()> {
     let (upstream_port, outbound_proxy_port, monitor_port) = pick_ports();
@@ -1101,7 +1061,7 @@ async fn test_outbound_proxy_with_missing_client_cert() -> Result<()> {
     let test_certs = setup_certificates()?;
 
     // Start HTTPS upstream
-    start_https_upstream(upstream_port, Bytes::from("Hello from upstream"), &test_certs).await?;
+    start_https_upstream(upstream_port, Bytes::from("Hello from upstream"), &test_certs.cert_dir).await?;
 
     // Create config for outbound proxy without client cert
     let config = create_test_config(
@@ -1114,7 +1074,7 @@ async fn test_outbound_proxy_with_missing_client_cert() -> Result<()> {
         None, // No client cert dir
     );
     let config = Config {
-        upstream_url: format!("https://127.0.0.1:{}", upstream_port),
+        upstream_url: Some(format!("https://127.0.0.1:{}", upstream_port)),
         ..config
     };
     let config = Arc::new(config);
