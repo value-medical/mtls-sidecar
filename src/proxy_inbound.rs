@@ -4,7 +4,7 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::header::HOST;
-use hyper::{body::Body, http::Uri, Request, Response, StatusCode};
+use hyper::{http::Uri, Request, Response, StatusCode};
 use std::sync::Arc;
 
 use crate::client_cert;
@@ -21,8 +21,6 @@ pub async fn handler<B, C>(
     client_cert: Option<Arc<rustls::pki_types::CertificateDer<'static>>>,
 ) -> Result<Response<ProxiedBody>, Error>
 where
-    B: Body<Data = Bytes>,
-    B::Error: Into<BodyError>,
     C: HttpClientLike<B>,
 {
     let (parts, body) = req.into_parts();
