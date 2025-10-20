@@ -5,7 +5,6 @@ use crate::config::Config;
 use crate::error::DomainError;
 use anyhow::{Context, Error, Result};
 use chrono::{DateTime, Utc};
-use log::error;
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
@@ -113,7 +112,7 @@ impl TlsManager {
         ca_dir_opt: &Option<PathBuf>,
         server_cert_dir_opt: &Option<PathBuf>,
         client_cert_dir_opt: &Option<PathBuf>,
-    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Error> {
+    ) -> Result<Vec<CertificateDer<'static>>, Error> {
         let mut ca_certs = Vec::new();
 
         if let Some(ca_dir) = ca_dir_opt {
@@ -141,7 +140,8 @@ impl TlsManager {
                         })?,
                 );
             } else {
-                error!("No CA bundle found in ca_dir: {}", ca_dir.to_string_lossy());
+                // It's alright if no CA bundle is found in ca_dir,
+                // as it can be provided from server/client cert dirs.
             }
         }
 
@@ -268,7 +268,7 @@ impl TlsManager {
 
     async fn update_earliest_expiry(
         &self,
-        certs: &[rustls::pki_types::CertificateDer<'static>],
+        certs: &[CertificateDer<'static>],
     ) {
         let earliest = *self.earliest_expiry.read().await;
         for cert_der in certs {
@@ -297,9 +297,9 @@ impl TlsManager {
     }
 
     fn build_server_config(
-        certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+        certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
-        ca_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+        ca_certs: Vec<CertificateDer<'static>>,
     ) -> Result<ServerConfig, Error> {
         let config_builder = ServerConfig::builder();
 
@@ -334,9 +334,9 @@ impl TlsManager {
     }
 
     fn build_client_config(
-        certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+        certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
-        ca_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+        ca_certs: Vec<CertificateDer<'static>>,
     ) -> Result<ClientConfig, Error> {
         // Build root cert store
         let mut roots = RootCertStore::empty();
