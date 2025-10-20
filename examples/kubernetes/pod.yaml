@@ -11,22 +11,33 @@ spec:
     - -c
     args:
     - |
-      id && \
-      ls -al /etc/ssl && \
-      ls -al /etc/ssl/certs && \
-      ls -al /etc/ssl/client && \
-      curl -D- \
-        --cacert /etc/ssl/certs/ca-bundle.crt \
-        --cert /etc/ssl/client/tls.crt \
-        --key /etc/ssl/client/tls.key \
-        https://mtls-sidecar-demo.default.svc.cluster.local/
+        while true; do
+          curl -D- --retry 5 --retry-delay 1 http://mtls-sidecar-demo.default.svc.cluster.local/
+          sleep 5
+        done
+    env:
+      - name: ALL_PROXY
+        value: http://localhost:8080
     volumeMounts:
     - name: trust-bundle
       mountPath: /etc/ssl/certs
       readOnly: true
-    - name: client-certs
-      mountPath: /etc/ssl/client
-      readOnly: true
+  - name: mtls-sidecar
+    image: sebcvm/mtls-sidecar
+    env:
+      - name: RUST_LOG
+        value: debug
+      - name: TLS_LISTEN_PORT
+        value: ""
+      - name: OUTBOUND_PROXY_PORT
+        value: "8080"
+    volumeMounts:
+      - name: trust-bundle
+        mountPath: /etc/ca
+        readOnly: true
+      - name: client-certs
+        mountPath: /etc/client-certs
+        readOnly: true
   volumes:
   - name: trust-bundle
     configMap:
