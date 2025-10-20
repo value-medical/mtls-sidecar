@@ -13,7 +13,7 @@ rustls-pemfile = "2.1"
 tokio-rustls = "0.26"
 hyper = { version = "1.7", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy"] }
-hyper-rustls = "0.27"
+hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
 http-body-util = "0.1"
 bytes = "1.0"
 tracing = "0.1"
@@ -47,7 +47,6 @@ tonic = { version = "0.14", default-features = false, features = ["transport", "
 prost = "0.14"
 tonic-prost = "0.14.2"
 tokio-stream = "0.1"
-hyper-rustls = "0.27"
 
 [[bench]]
 name = "benchmark"
@@ -57,3 +56,4 @@ path = "benchmark/benchmark.rs"
 [profile.release]
 lto = true
 codegen-units = 1
+debug = "line-tables-only"

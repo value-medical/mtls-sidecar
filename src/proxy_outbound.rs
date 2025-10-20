@@ -7,8 +7,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::header::HOST;
 use hyper::{http::uri::Scheme, http::Uri, Request, Response, StatusCode};
 use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use std::error::Error;
 
 pub async fn handler<B>(
@@ -61,10 +62,11 @@ where
         .with_tls_config((*client_config).clone())
         .https_only()
         .enable_http1()
+        .enable_http2()
         .build();
 
     // Create client
-    let client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, B> =
+    let client: Client<HttpsConnector<HttpConnector>, B> =
         Client::builder(TokioExecutor::new()).build(https);
 
     // Build upstream request
