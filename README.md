@@ -5,35 +5,35 @@
 [![Docker Pulls](https://img.shields.io/docker/pulls/sebcvm/mtls-sidecar)](https://hub.docker.com/r/sebcvm/mtls-sidecar)
 [![Docker Image Size](https://img.shields.io/docker/image-size/sebcvm/mtls-sidecar/latest?logo=docker)](https://hub.docker.com/r/sebcvm/mtls-sidecar)
 
-A minimal Rust-based sidecar proxy for enforcing inbound mTLS in Kubernetes pods. It terminates mTLS connections,
-verifies client certificates against trusted CAs, and forwards validated HTTP requests to an upstream application in the
-same pod. The sidecar monitors mounted certificate files for updates (e.g., from Vault Secrets Operator) and reloads TLS
-configuration without restarts.
+A minimal Rust-based sidecar proxy for enforcing mutual TLS in Kubernetes pods. It terminates inbound mTLS connections,
+verifies client certificates against trusted CAs, forwards validated HTTP requests to an upstream application in the
+same pod, and provides an outbound mTLS forward proxy for secure external connections. The sidecar monitors mounted
+certificate files for updates (e.g., from Vault Secrets Operator) and reloads TLS configuration without restarts.
 
 ## Purpose
 
 This component provides a lightweight layer for securing HTTP services with mutual TLS, integrating seamlessly with
-Kubernetes Secret mounts. It focuses on inbound termination and proxying, avoiding broader features like routing or
-outbound connections.
+Kubernetes Secret mounts. It focuses on inbound mTLS termination and proxying, and also provides an outbound mTLS forward
+proxy for secure outbound connections.
 
 ## Key Features
 
-- Enforces mTLS with client certificate verification against a CA bundle.
+- Inbound mTLS reverse proxy
+  - Accepts HTTPS requests on a dedicated port, performs client certificate verification against a CA bundle, and forwards valid requests to an upstream HTTP service.
+  - Optional injection of client certificate details into upstream headers.
+- Outbound mTLS forward proxy: Accepts HTTP requests on a separate port, forwards them as HTTPS connections authenticated with client certificates, verifying server identity against the CA bundle.
 - Hot-reloads TLS configuration on file changes.
-- Simple reverse proxy to a single upstream endpoint.
-- Optional injection of client certificate details into upstream headers.
-- Outbound mTLS forward proxy: Accepts HTTP requests on a separate localhost port and forwards them as HTTPS connections authenticated with client certificates, verifying server identity against the CA bundle.
-- Dedicated monitoring port for health probes (including server certificate expiry validation) and optional Prometheus metrics.
-- Supports both `kubernetes.io/tls` and VSO Opaque Secret formats via file auto-detection.
+  - Supports both `kubernetes.io/tls` and VSO Opaque Secret formats via file auto-detection.
 - Supports HTTP/1.1 and HTTP/2 proxying, enabling mTLS termination for gRPC services.
-- Low overhead: <18MB RAM, <15.0% CPU at 1k req/s (avg 15.6MB RAM, peak 17.6MB RAM, avg 12.0% CPU, peak 14.3% CPU)
-- Graceful shutdown.
+- Low overhead: <19MB RAM, <16.0% CPU at 1k req/s (avg 17.0MB RAM, peak 18.6MB RAM, avg 12.6% CPU, peak 15.3% CPU)
+- Dedicated monitoring port for health probes (including server certificate expiry validation) and optional Prometheus metrics.
 - Structured JSON logging for requests, reloads, and errors.
+- Graceful shutdown.
 
 ## Non-Features
 
 - No multi-port or advanced routing support.
-- No outbound mTLS or service discovery.
+- No service discovery.
 - No rate limiting, caching, or additional authentication.
 - Minimal logging and metrics for simplicity (upstream is expected to provide these).
 
@@ -44,21 +44,21 @@ unless noted.
 
 | Variable                 | Default Value                 | Description                                                  |
 |--------------------------|-------------------------------|--------------------------------------------------------------|
+| `CA_DIR`                 | `/etc/ca`                     | Directory containing the CA bundle file.                     |
 | `TLS_LISTEN_PORT`        | `8443`                        | TCP port for inbound mTLS listener.                          |
+| `SERVER_CERT_DIR`        | `/etc/certs`                  | Directory containing server certificate files.               |
 | `UPSTREAM_URL`           | `http://localhost:8080`       | Full URL for the proxy target.                               |
 | `UPSTREAM_READINESS_URL` | `http://localhost:8080/ready` | URL for upstream readiness check.                            |
-| `SERVER_CERT_DIR`        | `/etc/certs`                  | Directory containing server cert/key files.                  |
-| `CA_DIR`                 | `/etc/ca`                     | Directory containing the CA bundle file.                     |
 | `INJECT_CLIENT_HEADERS`  | `false`                       | If `true`, inject `X-Client-TLS-Info` header.                |
-| `OUTBOUND_PROXY_PORT`    | ``                            | TCP port for outbound mTLS proxy listener (empty disables). |
 | `CLIENT_CERT_DIR`        | `/etc/client-certs`           | Directory containing client certificate files.               |
+| `OUTBOUND_PROXY_PORT`    | ``                            | TCP port for outbound mTLS proxy listener (empty disables).  |
 | `MONITOR_PORT`           | `8081`                        | Port for health probes and metrics.                          |
 | `ENABLE_METRICS`         | `false`                       | If `true`, expose Prometheus `/metrics` on the monitor port. |
 
 ## Deployment Assumptions
 
 - Deployed as a Kubernetes sidecar container alongside the main application.
-- Secrets are mounted as read-only volumes to `CERT_DIR` and `CA_DIR`.
+- Secrets are mounted as read-only volumes to `SERVER_CERT_DIR` and `CA_DIR`.
 - Upstream is HTTP-only, accessible via localhost.
 - Runs as non-root user (UID 1000).
 - Supports HTTP/1.1 and HTTP/2; TLS 1.2+ with secure ciphers.
