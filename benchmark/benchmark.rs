@@ -106,7 +106,7 @@ async fn run_benchmark() -> Result<BenchmarkResult> {
         .env("TLS_LISTEN_PORT", sidecar_port.to_string())
         .env("UPSTREAM_URL", format!("http://127.0.0.1:{}", upstream_port))
         .env("UPSTREAM_READINESS_URL", format!("http://127.0.0.1:{}/ready", upstream_port))
-        .env("CERT_DIR", &cert_dir_str)
+        .env("SERVER_CERT_DIR", &cert_dir_str)
         .env("CA_DIR", &ca_dir_str)
         .env("INJECT_CLIENT_HEADERS", "false")
         .env("MONITOR_PORT", &monitor_port.to_string())

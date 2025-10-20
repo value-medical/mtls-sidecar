@@ -25,7 +25,7 @@ impl TlsManager {
     pub fn new() -> Self {
         TlsManager {
             server_config: RwLock::new(None),
-            server_required: false,
+            server_required: true,
             client_config: RwLock::new(None),
             client_required: false,
             earliest_expiry: RwLock::new(None),
@@ -48,19 +48,33 @@ impl TlsManager {
             &config.client_cert_dir,
         )
         .await?;
-        let server_cert_key_opt = if let Some(server_cert_dir) = &config.server_cert_dir {
-            Self::load_server_cert_and_key(server_cert_dir).await?
+
+        let server_cert_key_opt = if self.server_required {
+            if let Some(server_cert_dir) = &config.server_cert_dir {
+                Self::load_server_cert_and_key(server_cert_dir).await?
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Server certificate directory is required but not provided"
+                ));
+            }
         } else {
             None
         };
-        let client_cert_key_opt = if let Some(client_cert_dir) = &config.client_cert_dir {
-            Self::load_client_cert_and_key(client_cert_dir).await?
+
+        let client_cert_key_opt = if self.client_required {
+            if let Some(client_cert_dir) = &config.client_cert_dir {
+                Self::load_client_cert_and_key(client_cert_dir).await?
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Client certificate directory is required but not provided"
+                ));
+            }
         } else {
             None
         };
 
         // Compute and update earliest expiry
-        let mut earliest_expiry: DateTime<Utc> = Utc::now(); // TODO: now + 1 minute?
+        let mut earliest_expiry: Option<DateTime<Utc>> = None;
         Self::update_earliest_expiry(&mut earliest_expiry, &ca_certs);
         if let Some((certs, _)) = &server_cert_key_opt {
             Self::update_earliest_expiry(&mut earliest_expiry, &certs);
@@ -68,7 +82,7 @@ impl TlsManager {
         if let Some((certs, _)) = &client_cert_key_opt {
             Self::update_earliest_expiry(&mut earliest_expiry, &certs);
         }
-        *self.earliest_expiry.write().await = Some(earliest_expiry);
+        *self.earliest_expiry.write().await = earliest_expiry;
 
         // Update server config
         let mut server_config: Option<Arc<ServerConfig>> = None;
@@ -253,7 +267,7 @@ impl TlsManager {
     }
 
     fn update_earliest_expiry(
-        earliest: &mut DateTime<Utc>,
+        earliest: &mut Option<DateTime<Utc>>,
         certs: &[rustls::pki_types::CertificateDer<'static>],
     ) {
         for cert_der in certs {
@@ -263,7 +277,16 @@ impl TlsManager {
                     let not_after_dt = validity.not_after.to_datetime();
                     let expiry = chrono::DateTime::from_timestamp(not_after_dt.unix_timestamp(), 0)
                         .unwrap_or_else(|| Utc::now()); // fallback if conversion fails
-                    *earliest = (*earliest).min(expiry);
+                    match earliest {
+                        Some(current_earliest) => {
+                            if expiry < *current_earliest {
+                                *earliest = Some(expiry);
+                            }
+                        }
+                        None => {
+                            *earliest = Some(expiry);
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to parse certificate for expiry check: {:?}", e);
@@ -435,6 +458,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tls_manager_new_with_no_certs() {
+        let mut tls_manager = TlsManager::new();
+        tls_manager.server_required = false;
+        let config = new_config();
+        let result = tls_manager.reload(&config).await;
+        assert!(result.is_ok());
+        assert!(tls_manager.earliest_expiry.read().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_tls_manager_new_with_valid_certs() {
         let temp_dir = TempDir::new().unwrap();
         let mut config = new_config();
@@ -448,6 +481,7 @@ mod tests {
         let tls_manager = TlsManager::new();
         let result = tls_manager.reload(&config).await;
         assert!(result.is_ok());
+        assert!(tls_manager.earliest_expiry.read().await.is_some());
     }
 
     #[tokio::test]

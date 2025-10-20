@@ -353,15 +353,16 @@ async fn start_sidecar(
                 let (_, server_conn) = stream.get_ref();
                 let client_cert = server_conn
                     .peer_certificates()
-                    .and_then(|certs| certs.first().cloned());
+                    .and_then(|certs| certs.first().cloned())
+                    .and_then(|cert| Some(Arc::new(cert)));
                 let service = service_fn(move |mut req| {
                     if let Some(cert) = &client_cert {
                         req.extensions_mut().insert(cert.clone());
                     }
                     let up = upstream.clone();
                     let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    let addr = peer_addr;
-                    async move { mtls_sidecar::proxy_inbound::handler(req, &up, inject, client, addr).await }
+                    let cc = client_cert.clone().and_then(|cert| Some(Arc::clone(&cert)));
+                    async move { mtls_sidecar::proxy_inbound::handler(req, &up, inject, client, peer_addr, cc).await }
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -571,7 +572,8 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                 let (_, server_conn) = stream.get_ref();
                 let client_cert = server_conn
                     .peer_certificates()
-                    .and_then(|certs| certs.first().cloned());
+                    .and_then(|certs| certs.first().cloned())
+                    .and_then(|cert| Some(Arc::new(cert)));
                 let service = service_fn(move |mut req| {
                     if let Some(cert) = &client_cert {
                         req.extensions_mut().insert(cert.clone());
@@ -586,8 +588,8 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                     } else {
                         Arc::new(Client::builder(TokioExecutor::new()).build_http())
                     };
-                    let addr = peer_addr;
-                    async move { mtls_sidecar::proxy_inbound::handler(req, &up, false, client, addr).await }
+                    let cc = client_cert.clone().and_then(|cert| Some(Arc::clone(&cert)));
+                    async move { mtls_sidecar::proxy_inbound::handler(req, &up, false, client, peer_addr, cc).await }
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -918,8 +920,11 @@ async fn test_outbound_proxy_with_valid_certs() -> Result<()> {
     };
     let config = Arc::new(config);
 
-    let tls_manager = Arc::new(TlsManager::new());
+    let mut tls_manager = TlsManager::new();
+    tls_manager.server_required = false; // Outbound proxy does not need server certs
+    tls_manager.client_required = true;
     tls_manager.reload(&config).await?;
+    let tls_manager = Arc::new(tls_manager);
 
     // Start outbound proxy listener
     let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);

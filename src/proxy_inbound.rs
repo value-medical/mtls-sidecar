@@ -5,6 +5,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::header::HOST;
 use hyper::{body::Body, http::Uri, Request, Response, StatusCode};
+use std::sync::Arc;
 
 use crate::client_cert;
 use crate::header_filter;
@@ -17,6 +18,7 @@ pub async fn handler<B, C>(
     inject_client_headers: bool,
     client: C,
     client_addr: Option<std::net::SocketAddr>,
+    client_cert: Option<Arc<rustls::pki_types::CertificateDer<'static>>>,
 ) -> Result<Response<ProxiedBody>, Error>
 where
     B: Body<Data = Bytes>,
@@ -36,10 +38,6 @@ where
     }
 
     // Extract client cert from extensions
-    let client_cert = parts
-        .extensions
-        .get::<rustls::pki_types::CertificateDer<'static>>();
-
     if client_cert.is_none() {
         // No cert, return 401
         MTLS_FAILURES_TOTAL.inc();
@@ -75,7 +73,7 @@ where
 
     // If inject_client_headers, parse cert and add headers
     if inject_client_headers {
-        if let Some(cert_der) = client_cert {
+        if let Some(cert_der) = &client_cert {
             upstream_req_builder =
                 client_cert::inject_client_headers(upstream_req_builder, cert_der);
         }
@@ -192,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_missing_cert() {
         let req = Request::new(Empty::<Bytes>::new());
-        let resp = handler(req, "http://localhost:8080", false, MockClient, None)
+        let resp = handler(req, "http://localhost:8080", false, MockClient, None, None)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -212,10 +210,8 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
 
-        let mut req = Request::new(Empty::<Bytes>::new());
-        req.extensions_mut().insert(cert_der);
-
-        let result = handler(req, "http://localhost:8080", false, MockClient, None).await;
+        let req = Request::new(Empty::<Bytes>::new());
+        let result = handler(req, "http://localhost:8080", false, MockClient, None, Some(Arc::new(cert_der))).await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -242,9 +238,8 @@ mod tests {
         let key_pair = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-        req.extensions_mut().insert(cert_der);
 
-        let result = handler(req, "http://localhost:8080", false, client, None).await;
+        let result = handler(req, "http://localhost:8080", false, client, None, Some(Arc::new(cert_der))).await;
         assert!(result.is_ok());
 
         let captured_headers = captured.lock().unwrap();
@@ -278,9 +273,8 @@ mod tests {
         let key_pair = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-        req.extensions_mut().insert(cert_der);
 
-        let result = handler(req, "http://localhost:8080", true, client, None).await;
+        let result = handler(req, "http://localhost:8080", true, client, None, Some(Arc::new(cert_der))).await;
         assert!(result.is_ok());
 
         let captured_headers = captured.lock().unwrap();
