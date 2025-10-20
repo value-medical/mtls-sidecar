@@ -656,7 +656,7 @@ async fn test_invalid_config_exits() -> Result<()> {
     // Run the binary with invalid TLS_LISTEN_PORT
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mtls-sidecar"));
     cmd.env("TLS_LISTEN_PORT", "invalid_port");
-    cmd.env("CERT_DIR", "/tmp/nonexistent");
+    cmd.env("SERVER_CERT_DIR", "/tmp/nonexistent");
     cmd.env("CA_DIR", "/tmp/nonexistent");
 
     let output = cmd.output().expect("Failed to run command");
