@@ -1,3 +1,4 @@
+use std::error::Error;
 use anyhow::Result;
 use axum;
 use base64;
@@ -15,6 +16,8 @@ use reqwest::Certificate;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
+use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
 use tempfile::TempDir;
 use time::Duration;
 use time::OffsetDateTime;
@@ -887,6 +890,23 @@ async fn test_proxy_grpc() -> Result<()> {
     Ok(())
 }
 
+
+async fn new_outbound_client<B>(tls_manager: Arc<TlsManager>) -> Client<HttpsConnector<HttpConnector>, B>
+where
+    B: hyper::body::Body + Send + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<Box<dyn Error + Send + Sync>>,
+{
+    let client_config = tls_manager.client_config.read().await.clone().unwrap();
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config((*client_config).clone())
+        .https_only()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    Client::builder(TokioExecutor::new()).build(https)
+}
+
 #[tokio::test]
 async fn test_outbound_proxy_with_valid_certs() -> Result<()> {
     let (upstream_port, outbound_proxy_port, monitor_port) = pick_ports();
@@ -924,20 +944,19 @@ async fn test_outbound_proxy_with_valid_certs() -> Result<()> {
     tls_manager.server_required = false; // Outbound proxy does not need server certs
     tls_manager.client_required = true;
     tls_manager.reload(&config).await?;
-    let tls_manager = Arc::new(tls_manager);
 
     // Start outbound proxy listener
     let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
     let outbound_listener = TcpListener::bind(&outbound_addr).await?;
-    let tls_manager_outbound = Arc::clone(&tls_manager);
+    let outbound_client = Arc::new(new_outbound_client(Arc::new(tls_manager)).await);
     tokio::spawn(async move {
         loop {
             let (stream, _) = outbound_listener.accept().await.unwrap();
-            let tls_manager = Arc::clone(&tls_manager_outbound);
+            let outbound_client = Arc::clone(&outbound_client);
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
-                    let tls_mgr = Arc::clone(&tls_manager);
-                    async move { mtls_sidecar::proxy_outbound::handler(req, &tls_mgr).await }
+                    let outbound_client = Arc::clone(&outbound_client);
+                    async move { mtls_sidecar::proxy_outbound::handler(req, outbound_client).await }
                 });
                 if let Err(err) = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -1010,21 +1029,24 @@ async fn test_outbound_proxy_with_invalid_server_cert() -> Result<()> {
     };
     let config = Arc::new(config);
 
-    let tls_manager = Arc::new(TlsManager::new());
+    let mut tls_manager = TlsManager::new();
+    tls_manager.server_required = false; // Outbound proxy does not need server certs
+    tls_manager.client_required = true;
+    let tls_manager = Arc::new(tls_manager);
     tls_manager.reload(&config).await?;
 
     // Start outbound proxy listener
     let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
     let outbound_listener = TcpListener::bind(&outbound_addr).await?;
-    let tls_manager_outbound = Arc::clone(&tls_manager);
+    let outbound_client = Arc::new(new_outbound_client(Arc::clone(&tls_manager)).await);
     tokio::spawn(async move {
         loop {
             let (stream, _) = outbound_listener.accept().await.unwrap();
-            let tls_manager = Arc::clone(&tls_manager_outbound);
+            let outbound_client = Arc::clone(&outbound_client);
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
-                    let tls_mgr = Arc::clone(&tls_manager);
-                    async move { mtls_sidecar::proxy_outbound::handler(req, &tls_mgr).await }
+                    let outbound_client = Arc::clone(&outbound_client);
+                    async move { mtls_sidecar::proxy_outbound::handler(req, outbound_client).await }
                 });
                 if let Err(err) = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -1079,49 +1101,15 @@ async fn test_outbound_proxy_with_missing_client_cert() -> Result<()> {
     };
     let config = Arc::new(config);
 
-    let tls_manager = Arc::new(TlsManager::new());
-    tls_manager.reload(&config).await?;
-
-    // Start outbound proxy listener
-    let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
-    let outbound_listener = TcpListener::bind(&outbound_addr).await?;
-    let tls_manager_outbound = Arc::clone(&tls_manager);
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = outbound_listener.accept().await.unwrap();
-            let tls_manager = Arc::clone(&tls_manager_outbound);
-            tokio::spawn(async move {
-                let service = service_fn(move |req| {
-                    let tls_mgr = Arc::clone(&tls_manager);
-                    async move { mtls_sidecar::proxy_outbound::handler(req, &tls_mgr).await }
-                });
-                if let Err(err) = auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                {
-                    tracing::error!("Error serving outbound connection: {:?}", err);
-                }
-            });
-        }
-    });
-
-    // Wait for servers to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Make HTTP request to outbound proxy with target URI
-    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", outbound_proxy_port)).await?;
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-    tokio::spawn(async move {
-        conn.await.unwrap();
-    });
-    let req = Request::get(format!("http://127.0.0.1:{}/", upstream_port))
-        .body(Full::new(Bytes::new()))?;
-    let result = sender.send_request(req).await;
-    // Should fail because no client cert configured
+    let mut tls_manager = TlsManager::new();
+    tls_manager.server_required = false; // Outbound proxy does not need server certs
+    tls_manager.client_required = true;
+    let result = tls_manager.reload(&config).await;
     assert!(result.is_err());
 
     Ok(())
 }
+
 
 fn validity_period() -> (OffsetDateTime, OffsetDateTime) {
     let now = OffsetDateTime::now_utc();

@@ -1,6 +1,7 @@
 use anyhow::{Context, Error, Result};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
+use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
@@ -10,8 +11,8 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 
-use mtls_sidecar::{config, monitoring, proxy_inbound, tls_manager, watcher};
 use mtls_sidecar::error::DomainError;
+use mtls_sidecar::{config, monitoring, proxy_inbound, tls_manager, watcher};
 use tls_manager::TlsManager;
 
 fn setup_crypto_provider() {
@@ -46,12 +47,6 @@ async fn create_tls_manager(config: &Arc<config::Config>) -> Result<Arc<TlsManag
         .context("Failed to load TLS config")?;
     tracing::info!("TLS loaded");
     Ok(Arc::new(tls_manager))
-}
-
-fn create_http_client() -> Arc<Client<HttpConnector, Incoming>> {
-    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-    tracing::info!("HTTP client created");
-    client
 }
 
 async fn start_watcher(config: Arc<config::Config>, tls_manager: Arc<TlsManager>) {
@@ -92,15 +87,30 @@ async fn start_outbound_proxy(
         outbound_addr
     ))?;
     tracing::info!("Outbound proxy listening on {}", outbound_addr);
-    let tls_manager_outbound = Arc::clone(&tls_manager);
+
     tokio::spawn(async move {
         loop {
             let (stream, _) = outbound_listener.accept().await.unwrap();
-            let tls_manager = Arc::clone(&tls_manager_outbound);
+            let tls_manager = Arc::clone(&tls_manager);
             tokio::spawn(async move {
+
+                // Create a new HTTP client with current TLS config for every connection;
+                // this ensures that we always use the latest certs, with pooling still
+                // effective for multiple requests over the same connection.
+                let client_config = tls_manager.client_config.read().await.clone().unwrap();
+                let https = hyper_rustls::HttpsConnectorBuilder::new()
+                    .with_tls_config((*client_config).clone())
+                    .https_only()
+                    .enable_http1()
+                    .enable_http2()
+                    .build();
+                let client: Arc<Client<HttpsConnector<HttpConnector>, Incoming>> =
+                    Arc::new(Client::builder(TokioExecutor::new()).build(https));
+
+                // Handle connection
                 let service = service_fn(move |req| {
-                    let tls_mgr = Arc::clone(&tls_manager);
-                    async move { mtls_sidecar::proxy_outbound::handler(req, &tls_mgr).await }
+                    let client = Arc::clone(&client);
+                    async move { mtls_sidecar::proxy_outbound::handler(req, client).await }
                 });
                 if let Err(err) = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -129,7 +139,7 @@ async fn start_inbound_proxy(
         "upstream_url must be set for inbound proxy".to_string(),
     ))?;
     let inject_headers = config.inject_client_headers;
-    let http_client = create_http_client();
+    let http_client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
     let active_connections = Arc::new(AtomicUsize::new(0));
 
     let (sigterm, sigint) = setup_signals()?;
@@ -143,7 +153,7 @@ async fn start_inbound_proxy(
         sigterm,
         sigint,
     )
-        .await?;
+    .await?;
     shutdown(active_connections).await;
     Ok(())
 }
@@ -257,11 +267,7 @@ async fn main() -> Result<(), Error> {
         start_outbound_proxy(outbound_port, Arc::clone(&tls_manager)).await?;
     }
     if let Some(inbound_port) = config.tls_listen_port {
-        start_inbound_proxy(
-            inbound_port,
-            Arc::clone(&config),
-            Arc::clone(&tls_manager),
-        ).await?;
+        start_inbound_proxy(inbound_port, Arc::clone(&config), Arc::clone(&tls_manager)).await?;
     }
     Ok(())
 }
