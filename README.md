@@ -21,7 +21,10 @@ proxy for secure outbound connections.
 - Inbound mTLS reverse proxy
   - Accepts HTTPS requests on a dedicated port, performs client certificate verification against a CA bundle, and forwards valid requests to an upstream HTTP service.
   - Optional injection of client certificate details into upstream headers.
-- Outbound mTLS forward proxy: Accepts HTTP requests on a separate port, forwards them as HTTPS connections authenticated with client certificates, verifying server identity against the CA bundle.
+  - **Important**: The upstream service should listen on `localhost` only to prevent host network exposure.
+- Outbound mTLS forward proxy:
+  - Accepts HTTP connections on a separate port (bound to `localhost`).
+  - Forwards requests for HTTPS addresses, authenticating with client certificates and verifying server identity against the CA bundle.
 - Hot-reloads TLS configuration on file changes.
   - Supports both `kubernetes.io/tls` and VSO Opaque Secret formats via file auto-detection.
 - Supports HTTP/1.1 and HTTP/2 proxying, enabling mTLS termination for gRPC services.
@@ -120,7 +123,8 @@ For minimal upstream examples, refer to the `examples/` directory.
 
 ### Security Considerations
 
-- **Trust Model**: Upstream should treat the header as trusted (sidecar validates the cert), verifying `hash` against a known trust store if required.
+- **Trust Model**: Upstream should listen on `localhost` only to prevent host
+ should treat the header as trusted (sidecar validates the cert), verifying `hash` against a known trust store if required.
 - **Chain of Custody**: Suitable for single-hop scenarios; avoid forwarding to untrusted parties.
 - **Spoofing Prevention**: The sidecar strips this header on inbound requests to prevent client tampering.
 
