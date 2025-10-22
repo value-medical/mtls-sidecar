@@ -1,6 +1,6 @@
 use anyhow::{Context, Error, Result};
 use bytes::Bytes;
-use http::{Request, StatusCode};
+use http::Request;
 use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use hyper::service::service_fn;

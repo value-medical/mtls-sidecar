@@ -95,6 +95,21 @@ impl Config {
     pub fn from_env() -> Result<Self, Error> {
         Self::from_env_map(None)
     }
+
+    pub fn minimal() -> Self {
+        Config {
+            tls_listen_port: None,
+            upstream_url: None,
+            ca_dir: None,
+            server_cert_dir: None,
+            client_cert_dir: None,
+            inject_client_headers: false,
+            outbound_proxy_port: None,
+            monitor_port: 0,
+            enable_metrics: false,
+        }
+    }
+
     fn parse_optional_port(s: &str, name: &str) -> Result<Option<u16>> {
         if s.is_empty() {
             return Ok(None);
