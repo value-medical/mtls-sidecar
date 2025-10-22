@@ -22,6 +22,16 @@ where
 {
     let (parts, body) = req.into_parts();
 
+    if parts.method == hyper::Method::CONNECT {
+        // Do we want to handle CONNECT?
+        let bad_request_full = Full::new(Bytes::from("CONNECT method not supported"))
+            .map_err(|_| unreachable!());
+        let bad_request_body: BoxBody<Bytes, hyper::Error> = BoxBody::new(bad_request_full);
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(bad_request_body)?);
+    }
+
     // Reject the request if the Upgrade header is present -- currently unsupported.
     if parts.headers.contains_key("upgrade") {
         let bad_request_full = Full::new(Bytes::from("Bad Request")).map_err(|_| unreachable!());
