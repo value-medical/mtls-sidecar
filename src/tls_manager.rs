@@ -33,6 +33,17 @@ impl TlsManager {
         }
     }
 
+    pub async fn add_ca_cert_from_pem(&self, pem: &str) -> Result<(), Error> {
+        let cert_der = CertificateDer::from_pem_slice(pem.as_bytes())
+            .context("Failed to parse CA certificate from PEM")?;
+        let mut ca_certs = self.ca_certs.write().await;
+        let mut new_certs = (**ca_certs).clone();
+        new_certs.push(cert_der);
+        self.update_earliest_expiry(&new_certs).await;
+        *ca_certs = Arc::new(new_certs);
+        Ok(())
+    }
+
     pub async fn set_server_config(&self, server_config: Option<Arc<ServerConfig>>) {
         *self.server_config.write().await = server_config;
     }
@@ -204,8 +215,16 @@ impl TlsManager {
             })?;
 
         // Log the paths being used
-        tracing::info!("Using {} certificate: {}", entity_type, cert_path.to_string_lossy());
-        tracing::info!("Using {} private key: {}", entity_type, key_path.to_string_lossy());
+        tracing::info!(
+            "Using {} certificate: {}",
+            entity_type,
+            cert_path.to_string_lossy()
+        );
+        tracing::info!(
+            "Using {} private key: {}",
+            entity_type,
+            key_path.to_string_lossy()
+        );
 
         // Read certificate
         let cert_pem = fs::read(&cert_path).await.with_context(|| {
@@ -266,10 +285,7 @@ impl TlsManager {
         Some((cert_path, key_path))
     }
 
-    async fn update_earliest_expiry(
-        &self,
-        certs: &[CertificateDer<'static>],
-    ) {
+    async fn update_earliest_expiry(&self, certs: &[CertificateDer<'static>]) {
         let earliest = *self.earliest_expiry.read().await;
         for cert_der in certs {
             match parse_x509_certificate(cert_der) {
@@ -358,7 +374,6 @@ impl TlsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::DnValue::PrintableString;
     use rcgen::{
         BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
         Issuer, KeyPair, KeyUsagePurpose,
@@ -372,7 +387,6 @@ mod tests {
         Config {
             tls_listen_port: Some(8443),
             upstream_url: Some("http://localhost:8080".to_string()),
-            upstream_readiness_url: Some("http://localhost:8080/ready".to_string()),
             ca_dir: None,
             server_cert_dir: None,
             client_cert_dir: None,
@@ -528,7 +542,6 @@ mod tests {
         let config = Config {
             tls_listen_port: Some(8443),
             upstream_url: Some("http://localhost:8080".to_string()),
-            upstream_readiness_url: Some("http://localhost:8080/ready".to_string()),
             ca_dir: Some(ca_dir.clone()),
             server_cert_dir: Some(cert_dir.clone()),
             client_cert_dir: None,

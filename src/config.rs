@@ -13,7 +13,6 @@ pub struct Config {
     pub server_cert_dir: Option<PathBuf>,
     pub client_cert_dir: Option<PathBuf>,
     pub inject_client_headers: bool,
-    pub upstream_readiness_url: Option<String>,
     pub outbound_proxy_port: Option<u16>,
     pub monitor_port: u16,
     pub enable_metrics: bool,
@@ -26,7 +25,6 @@ struct ConfigBuilder {
     server_cert_dir: Option<PathBuf>,
     client_cert_dir: Option<PathBuf>,
     inject_client_headers: Option<bool>,
-    upstream_readiness_url: Option<String>,
     outbound_proxy_port: Option<u16>,
     monitor_port: Option<u16>,
     enable_metrics: Option<bool>,
@@ -63,11 +61,6 @@ impl ConfigBuilder {
         self
     }
 
-    fn upstream_readiness_url(mut self, val: String) -> Self {
-        self.upstream_readiness_url = Some(val);
-        self
-    }
-
     fn outbound_proxy_port(mut self, val: Option<u16>) -> Self {
         self.outbound_proxy_port = val;
         self
@@ -91,7 +84,6 @@ impl ConfigBuilder {
             server_cert_dir: self.server_cert_dir,
             client_cert_dir: self.client_cert_dir,
             inject_client_headers: self.inject_client_headers.unwrap_or(false),
-            upstream_readiness_url: self.upstream_readiness_url,
             outbound_proxy_port: self.outbound_proxy_port,
             monitor_port: self.monitor_port.unwrap(),
             enable_metrics: self.enable_metrics.unwrap(),
@@ -161,11 +153,10 @@ impl Config {
             }
             .unwrap_or_else(|| match key {
                 "TLS_LISTEN_PORT" => "8443".to_string(),
-                "UPSTREAM_URL" => "http://localhost:8080".to_string(),
+                "UPSTREAM_URL" => "http://localhost:8000".to_string(),
                 "SERVER_CERT_DIR" => "/etc/certs".to_string(),
                 "CA_DIR" => "/etc/ca".to_string(),
                 "INJECT_CLIENT_HEADERS" => "false".to_string(),
-                "UPSTREAM_READINESS_URL" => "http://localhost:8080/ready".to_string(),
                 "OUTBOUND_PROXY_PORT" => "".to_string(),
                 "CLIENT_CERT_DIR" => "/etc/client-certs".to_string(),
                 "MONITOR_PORT" => "8081".to_string(),
@@ -193,10 +184,6 @@ impl Config {
                 &get_var("INJECT_CLIENT_HEADERS"),
                 "INJECT_CLIENT_HEADERS",
             )?)
-            .upstream_readiness_url(Self::parse_uri(
-                &get_var("UPSTREAM_READINESS_URL"),
-                "UPSTREAM_READINESS_URL",
-            )?)
             .outbound_proxy_port(Self::parse_optional_port(
                 &get_var("OUTBOUND_PROXY_PORT"),
                 "OUTBOUND_PROXY_PORT",
@@ -220,7 +207,7 @@ mod tests {
         let env_map = HashMap::new();
         let config = Config::from_env_map(Some(&env_map)).unwrap();
         assert_eq!(config.tls_listen_port, Some(8443));
-        assert_eq!(config.upstream_url, Some("http://localhost:8080".to_string()));
+        assert_eq!(config.upstream_url, Some("http://localhost:8000".to_string()));
         assert_eq!(config.ca_dir.unwrap().to_str().unwrap(), "/etc/ca");
         assert_eq!(
             config.server_cert_dir.unwrap().to_str().unwrap(),
@@ -231,7 +218,6 @@ mod tests {
             "/etc/client-certs"
         );
         assert_eq!(config.inject_client_headers, false);
-        assert_eq!(config.upstream_readiness_url, Some("http://localhost:8080/ready".to_string()));
         assert_eq!(config.outbound_proxy_port, None);
         assert_eq!(config.monitor_port, 8081);
         assert_eq!(config.enable_metrics, false);
@@ -244,10 +230,6 @@ mod tests {
         env_map.insert(
             "UPSTREAM_URL".to_string(),
             "http://example.com:9090".to_string(),
-        );
-        env_map.insert(
-            "UPSTREAM_READINESS_URL".to_string(),
-            "http://example.com:9090/health".to_string(),
         );
         env_map.insert("SERVER_CERT_DIR".to_string(), "/custom/certs".to_string());
         env_map.insert("CA_DIR".to_string(), "/custom/ca".to_string());
@@ -266,10 +248,6 @@ mod tests {
             "/etc/client-certs"
         );
         assert_eq!(config.inject_client_headers, true);
-        assert_eq!(
-            config.upstream_readiness_url,
-            Some("http://example.com:9090/health".to_string())
-        );
         assert_eq!(config.outbound_proxy_port, None);
         assert_eq!(config.monitor_port, 8081);
         assert_eq!(config.enable_metrics, false);

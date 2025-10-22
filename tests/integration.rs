@@ -155,7 +155,6 @@ fn create_test_config(
     Config {
         tls_listen_port: Some(sidecar_port),
         upstream_url: Some(format!("http://127.0.0.1:{}", upstream_port)),
-        upstream_readiness_url: Some(format!("http://127.0.0.1:{}/ready", upstream_port)),
         ca_dir: Some(test_certs.ca_dir.clone()),
         server_cert_dir: Some(test_certs.cert_dir.clone()),
         client_cert_dir,
@@ -301,7 +300,6 @@ async fn start_https_upstream(port: u16, response: Bytes, cert_dir: &PathBuf) ->
     let config = Config {
         tls_listen_port: Some(port),
         upstream_url: None,
-        upstream_readiness_url: None,
         ca_dir: None, // Do not require client cert for simplicity
         server_cert_dir: Some(cert_dir.clone()),
         client_cert_dir: None,

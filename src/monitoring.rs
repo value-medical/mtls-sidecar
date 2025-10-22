@@ -1,20 +1,10 @@
 use crate::config::Config;
 use crate::tls_manager::TlsManager;
-use axum::{
-    body::Body as AxumBody,
-    http::{Request, StatusCode},
-    routing::get,
-    Router,
-};
-use bytes::Bytes;
+use axum::{http::StatusCode, routing::get, Router};
 use chrono::Utc;
-use http_body_util::Empty;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use lazy_static::lazy_static;
 use prometheus::{register_int_counter, Encoder, IntCounter, TextEncoder};
 use std::sync::Arc;
-use std::time::Duration;
 
 lazy_static! {
     pub static ref TLS_RELOADS_TOTAL: IntCounter =
@@ -29,11 +19,9 @@ lazy_static! {
 }
 
 pub fn create_router(config: Arc<Config>, tls_manager: Arc<TlsManager>) -> Router {
-    let readiness_url = config.upstream_readiness_url.clone();
-
     let mut router = Router::new().route("/live", get(live_handler)).route(
         "/ready",
-        get(move |req| ready_handler(req, readiness_url.clone(), Arc::clone(&tls_manager))),
+        get(move || ready_handler(Arc::clone(&tls_manager))),
     );
 
     if config.enable_metrics {
@@ -61,37 +49,12 @@ async fn check_certificate_expiry(tls_manager: &TlsManager) -> Result<(), ()> {
     Ok(())
 }
 
-async fn ready_handler(
-    req: Request<AxumBody>,
-    readiness_url_opt: Option<String>,
-    tls_manager: Arc<TlsManager>,
-) -> Result<&'static str, StatusCode> {
+async fn ready_handler(tls_manager: Arc<TlsManager>) -> Result<&'static str, StatusCode> {
     tracing::info!("Readiness probe called");
 
     // Check certificate expiry
     if let Err(_) = check_certificate_expiry(&tls_manager).await {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    if let Some(readiness_url) = readiness_url_opt {
-        let client = Client::builder(TokioExecutor::new()).build_http();
-
-        let mut builder = hyper::Request::get(&readiness_url);
-        for (key, value) in req.headers() {
-            builder = builder.header(key, value);
-        }
-        let request = builder
-            .body(Empty::<Bytes>::new())
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        let response = tokio::time::timeout(Duration::from_secs(1), client.request(request))
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-
-        if !response.status().is_success() {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
     }
 
     Ok("OK")
@@ -110,16 +73,18 @@ async fn metrics_handler() -> Result<String, StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::{body::Body, http::StatusCode};
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
-    use rustls::{ClientConfig, ServerConfig};
+    use rcgen::{CertificateParams, DnType, KeyPair};
+    use rustls::ServerConfig;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
+    use time::OffsetDateTime;
     use tokio::net::TcpListener;
     use tokio::spawn;
-    use {Request, StatusCode};
 
     #[derive(Debug)]
     struct DummyResolver;
@@ -147,7 +112,6 @@ mod tests {
             Arc::new(Config {
                 tls_listen_port: Some(8443),
                 upstream_url: Some("http://localhost:8080".to_string()),
-                upstream_readiness_url: Some("http://localhost:8080/ready".to_string()),
                 ca_dir: Some(PathBuf::from("/etc/ca")),
                 server_cert_dir: Some(PathBuf::from("/etc/certs")),
                 client_cert_dir: Some(PathBuf::from("/etc/client-certs")),
@@ -197,37 +161,26 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let req = Request::get("/ready").body(Body::empty()).unwrap();
-        let result = ready_handler(
-            req,
-            Some(format!("http://127.0.0.1:{}/ready", upstream_port).to_string()),
-            tls_manager,
-        )
-        .await;
+        let result = ready_handler(tls_manager).await;
         assert_eq!(result, Ok("OK"));
     }
 
     #[tokio::test]
     async fn test_ready_handler_failure() {
+        // Generate an expired root CA certificate
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "Test CA");
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::hours(2);
+        params.not_after = now - time::Duration::hours(1);
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
         let tls_manager = Arc::new(TlsManager::new());
-        tls_manager
-            .set_server_config(Some(Arc::new(
-                ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(Arc::new(DummyResolver)),
-            )))
-            .await;
-        tls_manager
-            .set_client_config(Some(Arc::new(
-                ClientConfig::builder()
-                    .with_root_certificates(rustls::RootCertStore::empty())
-                    .with_no_client_auth(),
-            )))
-            .await;
-
-        let req = Request::get("/ready").body(Body::empty()).unwrap();
-        let result =
-            ready_handler(req, Some("http://127.0.0.1:9999/ready".to_string()), tls_manager).await;
+        tls_manager.add_ca_cert_from_pem(&cert.pem()).await.unwrap();
+        let result = ready_handler(tls_manager).await;
         assert_eq!(result, Err(StatusCode::SERVICE_UNAVAILABLE));
     }
 

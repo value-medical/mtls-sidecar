@@ -45,18 +45,17 @@ proxy for secure outbound connections.
 Configuration is via environment variables only, with sensible defaults for common setups. All vars are optional strings
 unless noted.
 
-| Variable                 | Default Value                 | Description                                                  |
-|--------------------------|-------------------------------|--------------------------------------------------------------|
-| `CA_DIR`                 | `/etc/ca`                     | Directory containing the CA bundle file.                     |
-| `TLS_LISTEN_PORT`        | `8443`                        | TCP port for inbound mTLS listener.                          |
-| `SERVER_CERT_DIR`        | `/etc/certs`                  | Directory containing server certificate files.               |
 | `UPSTREAM_URL`           | `http://localhost:8080`       | Full URL for the proxy target.                               |
-| `UPSTREAM_READINESS_URL` | `http://localhost:8080/ready` | URL for upstream readiness check.                            |
-| `INJECT_CLIENT_HEADERS`  | `false`                       | If `true`, inject `X-Client-TLS-Info` header.                |
-| `CLIENT_CERT_DIR`        | `/etc/client-certs`           | Directory containing client certificate files.               |
-| `OUTBOUND_PROXY_PORT`    | ``                            | TCP port for outbound mTLS proxy listener (empty disables).  |
-| `MONITOR_PORT`           | `8081`                        | Port for health probes and metrics.                          |
-| `ENABLE_METRICS`         | `false`                       | If `true`, expose Prometheus `/metrics` on the monitor port. |
+| Variable                 | Default Value           | Description                                                  |
+|--------------------------|-------------------------|--------------------------------------------------------------|
+| `CA_DIR`                 | `/etc/ca`               | Directory containing the CA bundle file.                     |
+| `TLS_LISTEN_PORT`        | `8443`                  | TCP port for inbound mTLS listener.                          |
+| `SERVER_CERT_DIR`        | `/etc/certs`            | Directory containing server certificate files.               |
+| `INJECT_CLIENT_HEADERS`  | `false`                 | If `true`, inject `X-Client-TLS-Info` header.                |
+| `CLIENT_CERT_DIR`        | `/etc/client-certs`     | Directory containing client certificate files.               |
+| `OUTBOUND_PROXY_PORT`    | ``                      | TCP port for outbound mTLS proxy listener (empty disables).  |
+| `MONITOR_PORT`           | `8081`                  | Port for health probes and metrics.                          |
+| `ENABLE_METRICS`         | `false`                 | If `true`, expose Prometheus `/metrics` on the monitor port. |
 
 ## Deployment Assumptions
 
