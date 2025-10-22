@@ -127,19 +127,6 @@ The format is designed for easy integration in common web service languages.
 Upstream code should validate the header presence and decode/parse safely (e.g., handle missing/invalid values gracefully).
 For minimal upstream examples, refer to the `examples/` directory.
 
-- **Java** (using Spring or similar):
-  ```java
-  import java.util.Base64;
-  import com.fasterxml.jackson.databind.ObjectMapper;
-  String header = request.getHeader("X-Client-TLS-Info");
-  if (header != null) {
-      String jsonStr = new String(Base64.getDecoder().decode(header));
-      Map<String, Object> info = new ObjectMapper().readValue(jsonStr, Map.class);
-      String clientSubject = (String) info.get("subject");
-      log.info("Client Subject: " + clientSubject);
-  }
-  ```
-
 ### Security Considerations
 
 - **Trust Model**: Upstream should treat the header as trusted (sidecar validates the cert), verifying `hash` against a known trust store if required.
