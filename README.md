@@ -21,7 +21,6 @@ proxy for secure outbound connections.
 - Inbound mTLS reverse proxy
   - Accepts HTTPS requests on a dedicated port, performs client certificate verification against a CA bundle, and forwards valid requests to an upstream HTTP service.
   - Optional injection of client certificate details into upstream headers.
-  - **Important**: The upstream service should listen on `localhost` only to prevent host network exposure.
 - Outbound mTLS forward proxy:
   - Accepts HTTP connections on a separate port (bound to `localhost`).
   - Forwards requests for HTTPS addresses, authenticating with client certificates and verifying server identity against the CA bundle.
@@ -35,22 +34,43 @@ proxy for secure outbound connections.
 
 ## Non-Features
 
+- No protocol support besides HTTP/1.1 and HTTP/2.
 - No multi-port or advanced routing support.
 - No service discovery.
 - No rate limiting, caching, or additional authentication.
 - Minimal logging and metrics for simplicity (upstream is expected to provide these).
+
+## Usage
+
+### Inbound Proxy
+
+**Your application should listen on `localhost` only to prevent host network exposure.**
+The default is port `8000`, configurable via `UPSTREAM_URL`.
+
+Your application expose use a separate port (bound to all interfaces) for monitoring (health probes, metrics).
+
+To receive client cert details, set `INJECT_CLIENT_HEADERS=true`,
+and refer to the [Client Certificate Header Injection](#client-certificate-header-injection) section for parsing details.
+
+Point your Service object to the sidecar's mTLS listener (`TLS_LISTEN_PORT`, default `8443`) for inbound mTLS connections.
+
+### Outbound Proxy
+
+By default, the outbound proxy is disabled. Set e.g. `OUTBOUND_PROXY_PORT=3128` to enable it.
+Configure your application to use `http://localhost:<OUTBOUND_PROXY_PORT>` as its HTTP proxy.
+The sidecar will handle mTLS connections for HTTPS requests made via this proxy.
 
 ## Configuration
 
 Configuration is via environment variables only, with sensible defaults for common setups. All vars are optional strings
 unless noted.
 
-| `UPSTREAM_URL`           | `http://localhost:8080`       | Full URL for the proxy target.                               |
 | Variable                 | Default Value           | Description                                                  |
 |--------------------------|-------------------------|--------------------------------------------------------------|
 | `CA_DIR`                 | `/etc/ca`               | Directory containing the CA bundle file.                     |
 | `TLS_LISTEN_PORT`        | `8443`                  | TCP port for inbound mTLS listener.                          |
 | `SERVER_CERT_DIR`        | `/etc/certs`            | Directory containing server certificate files.               |
+| `UPSTREAM_URL`           | `http://localhost:8000` | Full URL for the proxy target (should be on localhost).      |
 | `INJECT_CLIENT_HEADERS`  | `false`                 | If `true`, inject `X-Client-TLS-Info` header.                |
 | `CLIENT_CERT_DIR`        | `/etc/client-certs`     | Directory containing client certificate files.               |
 | `OUTBOUND_PROXY_PORT`    | ``                      | TCP port for outbound mTLS proxy listener (empty disables).  |
@@ -122,8 +142,7 @@ For minimal upstream examples, refer to the `examples/` directory.
 
 ### Security Considerations
 
-- **Trust Model**: Upstream should listen on `localhost` only to prevent host
- should treat the header as trusted (sidecar validates the cert), verifying `hash` against a known trust store if required.
+- **Trust Model**: Upstream should treat the header as trusted (sidecar validates the cert), verifying `hash` against a known trust store if required.
 - **Chain of Custody**: Suitable for single-hop scenarios; avoid forwarding to untrusted parties.
 - **Spoofing Prevention**: The sidecar strips this header on inbound requests to prevent client tampering.
 
