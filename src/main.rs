@@ -1,6 +1,6 @@
 use anyhow::{Context, Error, Result};
 use bytes::Bytes;
-use http::Request;
+use http::{Request, StatusCode};
 use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -103,12 +103,14 @@ async fn accept_outbound_connection(stream: TcpStream, tls_manager: Arc<TlsManag
     let client = Arc::new(Client::builder(TokioExecutor::new()).build(https));
 
     // Handle connection
-    let service = service_fn(move |req: Request<Incoming>| {
+    let service = move |req: Request<Incoming>| {
         let client = Arc::clone(&client);
-        async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), client).await }
-    });
+        let config = Arc::clone(&client_config);
+        async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), client, config).await }
+    };
+
     if let Err(err) = auto::Builder::new(TokioExecutor::new())
-        .serve_connection(TokioIo::new(stream), service)
+        .serve_connection_with_upgrades(TokioIo::new(stream), service_fn(service))
         .await
     {
         tracing::error!("Error serving outbound connection: {:?}", err);

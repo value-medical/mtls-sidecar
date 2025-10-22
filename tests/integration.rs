@@ -9,6 +9,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper::server::conn::http1;
 use hyper_util::server::conn::auto;
 use portpicker;
 use rcgen::{CertificateParams, DnType, Issuer, KeyPair};
@@ -21,7 +22,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use tempfile::TempDir;
 use time::Duration;
 use time::OffsetDateTime;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
 use x509_parser::nom::AsBytes;
@@ -542,6 +544,307 @@ async fn test_file_watching_reload() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_outbound_proxy_connect_tunnel() -> Result<()> {
+    let (upstream_port, outbound_proxy_port, monitor_port) = pick_ports();
+
+    let test_certs = setup_certificates()?;
+
+    // Start HTTPS upstream server
+    start_https_upstream(upstream_port, Bytes::from("Hello from CONNECT tunnel"), &test_certs.cert_dir).await?;
+
+    // Create client cert dir
+    let client_cert_dir = test_certs._temp_dir.path().join("client-certs");
+    std::fs::create_dir(&client_cert_dir)?;
+    std::fs::write(client_cert_dir.join("tls.crt"), test_certs.client_cert.pem())?;
+    std::fs::write(client_cert_dir.join("tls.key"), test_certs.client_key.serialize_pem())?;
+
+    // Create config for outbound proxy
+    let config = create_test_config(
+        upstream_port,
+        0, // sidecar_port not used
+        monitor_port,
+        &test_certs,
+        false,
+        Some(outbound_proxy_port),
+        Some(client_cert_dir),
+    );
+    let config = Arc::new(config);
+
+    let mut tls_manager = TlsManager::new();
+    tls_manager.server_required = false;
+    tls_manager.client_required = true;
+    tls_manager.reload(&config).await?;
+    let tls_manager = Arc::new(tls_manager);
+
+    // Start outbound proxy listener
+    let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
+    let outbound_listener = TcpListener::bind(&outbound_addr).await?;
+    let (outbound_client, outbound_config) = new_outbound_client(Arc::clone(&tls_manager)).await;
+    let outbound_client = Arc::new(outbound_client);
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = outbound_listener.accept().await.unwrap();
+            let outbound_client = Arc::clone(&outbound_client);
+            let outbound_config = Arc::clone(&outbound_config);
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    let outbound_client = Arc::clone(&outbound_client);
+                    let outbound_config = Arc::clone(&outbound_config);
+                    async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), outbound_client, outbound_config).await }
+                });
+                if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                    .await
+                {
+                    tracing::error!("Error serving outbound connection: {:?}", err);
+                }
+            });
+        }
+    });
+
+    // Wait for servers to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Connect to outbound proxy and send CONNECT request
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", outbound_proxy_port)).await?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    tokio::spawn(async move {
+        conn.await.unwrap();
+    });
+
+    // Send CONNECT request
+    let connect_req = Request::connect(format!("127.0.0.1:{}", upstream_port))
+        .body(Full::new(Bytes::new()))?;
+    let resp = sender.send_request(connect_req).await?;
+    assert_eq!(resp.status(), 200);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_outbound_proxy_connect_data_transmission() -> Result<()> {
+    let (upstream_port, outbound_proxy_port, monitor_port) = pick_ports();
+
+    let test_certs = setup_certificates()?;
+
+    // Start HTTPS upstream server
+    start_https_upstream(upstream_port, Bytes::from("Hello from CONNECT tunnel"), &test_certs.cert_dir).await?;
+
+    // Create client cert dir
+    let client_cert_dir = test_certs._temp_dir.path().join("client-certs");
+    std::fs::create_dir(&client_cert_dir)?;
+    std::fs::write(client_cert_dir.join("tls.crt"), test_certs.client_cert.pem())?;
+    std::fs::write(client_cert_dir.join("tls.key"), test_certs.client_key.serialize_pem())?;
+
+    // Create config for outbound proxy
+    let config = create_test_config(
+        upstream_port,
+        0, // sidecar_port not used
+        monitor_port,
+        &test_certs,
+        false,
+        Some(outbound_proxy_port),
+        Some(client_cert_dir),
+    );
+    let config = Arc::new(config);
+
+    let mut tls_manager = TlsManager::new();
+    tls_manager.server_required = false;
+    tls_manager.client_required = true;
+    tls_manager.reload(&config).await?;
+    let tls_manager = Arc::new(tls_manager);
+
+    // Start outbound proxy listener
+    let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
+    let outbound_listener = TcpListener::bind(&outbound_addr).await?;
+    let (outbound_client, outbound_config) = new_outbound_client(Arc::clone(&tls_manager)).await;
+    let outbound_client = Arc::new(outbound_client);
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = outbound_listener.accept().await.unwrap();
+            let outbound_client = Arc::clone(&outbound_client);
+            let outbound_config = Arc::clone(&outbound_config);
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    let outbound_client = Arc::clone(&outbound_client);
+                    let outbound_config = Arc::clone(&outbound_config);
+                    async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), outbound_client, outbound_config).await }
+                });
+                let builder = auto::Builder::new(TokioExecutor::new());
+                let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
+                if let Err(err) = conn.await
+                {
+                    tracing::error!("Error serving outbound connection: {:?}", err);
+                }
+            });
+        }
+    });
+
+    // Wait for servers to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Connect to outbound proxy
+    let mut tcp = TcpStream::connect(format!("127.0.0.1:{}", outbound_proxy_port)).await?;
+
+    // Send CONNECT request manually
+    let connect_request = format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: upgrade\r\nUpgrade: connect\r\n\r\n", upstream_port, upstream_port);
+    tcp.write_all(connect_request.as_bytes()).await?;
+    println!("Sent connect request");
+
+    // Read proxy response
+    let mut buffer = vec![0; 1024];
+    let n = tcp.read(&mut buffer).await?;
+    let response = String::from_utf8_lossy(&buffer[..n]);
+    assert!(response.contains("200"), "Expected 200, got: {}", response);
+    println!("Received: {}", response);
+
+    // Now attempt to send data through the tunnel
+    let request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    tcp.write_all(request.as_bytes()).await?;
+    println!("Written request");
+    tcp.flush().await?;
+
+    // Try to read the response
+    let mut buffer = vec![0; 1024];
+    let n = tcp.read(&mut buffer).await?;
+    let response = String::from_utf8_lossy(&buffer[..n]);
+    assert!(response.contains("Hello from CONNECT tunnel"), "Data transmission failed, got: {}", response);
+    println!("Read response");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_outbound_proxy_upgrade() -> Result<()> {
+    let (upstream_port, outbound_proxy_port, monitor_port) = pick_ports();
+
+    let test_certs = setup_certificates()?;
+
+    // Start upstream that supports upgrade
+    start_upgrade_upstream(upstream_port, &test_certs.cert_dir).await?;
+
+    // Create client cert dir
+    let client_cert_dir = test_certs._temp_dir.path().join("client-certs");
+    std::fs::create_dir(&client_cert_dir)?;
+    std::fs::write(client_cert_dir.join("tls.crt"), test_certs.client_cert.pem())?;
+    std::fs::write(client_cert_dir.join("tls.key"), test_certs.client_key.serialize_pem())?;
+
+    // Create config for outbound proxy
+    let config = create_test_config(
+        upstream_port,
+        0,
+        monitor_port,
+        &test_certs,
+        false,
+        Some(outbound_proxy_port),
+        Some(client_cert_dir),
+    );
+    let config = Config {
+        upstream_url: Some(format!("http://127.0.0.1:{}", upstream_port)),
+        ..config
+    };
+    let config = Arc::new(config);
+
+    let mut tls_manager = TlsManager::new();
+    tls_manager.server_required = false;
+    tls_manager.client_required = true;
+    tls_manager.reload(&config).await?;
+    let tls_manager = Arc::new(tls_manager);
+
+    // Start outbound proxy listener
+    let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
+    let outbound_listener = TcpListener::bind(&outbound_addr).await?;
+    let (outbound_client, outbound_config) = new_outbound_client(Arc::clone(&tls_manager)).await;
+    let outbound_client = Arc::new(outbound_client);
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = outbound_listener.accept().await.unwrap();
+            let outbound_client = Arc::clone(&outbound_client);
+            let outbound_config = Arc::clone(&outbound_config);
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    let outbound_client = Arc::clone(&outbound_client);
+                    let outbound_config = Arc::clone(&outbound_config);
+                    async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), outbound_client, outbound_config).await }
+                });
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                {
+                    tracing::error!("Error serving outbound connection: {:?}", err);
+                }
+            });
+        }
+    });
+
+    // Wait for servers to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Connect to outbound proxy and send upgrade request
+    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", outbound_proxy_port)).await?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    tokio::spawn(async move {
+        conn.await.unwrap();
+    });
+
+    // Send request with upgrade header
+    let upgrade_req = Request::get(format!("http://127.0.0.1:{}/upgrade", upstream_port))
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .body(Full::new(Bytes::new()))?;
+    let resp = sender.send_request(upgrade_req).await?;
+    assert_eq!(resp.status(), 101); // Switching Protocols
+
+    Ok(())
+}
+
+async fn start_upgrade_upstream(port: u16, cert_dir: &PathBuf) -> Result<()> {
+    let upstream_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let tls_manager = Arc::new(TlsManager::new());
+    let config = Config {
+        tls_listen_port: Some(port),
+        upstream_url: None,
+        ca_dir: None,
+        server_cert_dir: Some(cert_dir.clone()),
+        client_cert_dir: None,
+        inject_client_headers: false,
+        outbound_proxy_port: None,
+        monitor_port: 8081,
+        enable_metrics: false,
+    };
+    tls_manager.reload(&config).await?;
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let tls_manager = Arc::clone(&tls_manager);
+            tokio::spawn(async move {
+                let current_config = tls_manager.server_config.read().await.clone().unwrap();
+                let acceptor = TlsAcceptor::from(current_config);
+                let stream = acceptor.accept(stream).await.unwrap();
+                let service = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    if req.headers().contains_key("upgrade") {
+                        let resp = Response::builder()
+                            .status(101)
+                            .header("upgrade", "websocket")
+                            .header("connection", "upgrade")
+                            .body(Full::new(Bytes::new()))
+                            .unwrap();
+                        Ok::<_, hyper::Error>(resp)
+                    } else {
+                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("Normal response"))))
+                    }
+                });
+                auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_tls_handshake_failure_handling() -> Result<()> {
     let (upstream_port, sidecar_port, monitor_port) = pick_ports();
 
@@ -897,7 +1200,7 @@ async fn test_proxy_grpc() -> Result<()> {
 }
 
 
-async fn new_outbound_client<B>(tls_manager: Arc<TlsManager>) -> Client<HttpsConnector<HttpConnector>, B>
+async fn new_outbound_client<B>(tls_manager: Arc<TlsManager>) -> (Client<HttpsConnector<HttpConnector>, B>, Arc<rustls::ClientConfig>)
 where
     B: hyper::body::Body + Send + 'static + Unpin,
     B::Data: Send,
@@ -910,7 +1213,7 @@ where
         .enable_http1()
         .enable_http2()
         .build();
-    Client::builder(TokioExecutor::new()).build(https)
+    (Client::builder(TokioExecutor::new()).build(https), client_config)
 }
 
 #[tokio::test]
@@ -954,16 +1257,18 @@ async fn test_outbound_proxy_with_valid_certs() -> Result<()> {
     // Start outbound proxy listener
     let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
     let outbound_listener = TcpListener::bind(&outbound_addr).await?;
-    let outbound_client = new_outbound_client(Arc::new(tls_manager)).await;
+    let (outbound_client, outbound_config) = new_outbound_client(Arc::new(tls_manager)).await;
     let outbound_client = Arc::new(outbound_client);
     tokio::spawn(async move {
         loop {
             let (stream, _) = outbound_listener.accept().await.unwrap();
             let outbound_client = Arc::clone(&outbound_client);
+            let outbound_config = Arc::clone(&outbound_config);
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let outbound_client = Arc::clone(&outbound_client);
-                    async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), outbound_client).await }
+                    let outbound_config = Arc::clone(&outbound_config);
+                    async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), outbound_client, outbound_config).await }
                 });
                 if let Err(err) = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -1045,16 +1350,18 @@ async fn test_outbound_proxy_with_invalid_server_cert() -> Result<()> {
     // Start outbound proxy listener
     let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
     let outbound_listener = TcpListener::bind(&outbound_addr).await?;
-    let outbound_client = new_outbound_client(Arc::clone(&tls_manager)).await;
+    let (outbound_client, outbound_config) = new_outbound_client(Arc::clone(&tls_manager)).await;
     let outbound_client = Arc::new(outbound_client);
     tokio::spawn(async move {
         loop {
             let (stream, _) = outbound_listener.accept().await.unwrap();
             let outbound_client = Arc::clone(&outbound_client);
+            let outbound_config = Arc::clone(&outbound_config);
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let outbound_client = Arc::clone(&outbound_client);
-                    async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), outbound_client).await }
+                    let outbound_config = Arc::clone(&outbound_config);
+                    async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), outbound_client, outbound_config).await }
                 });
                 if let Err(err) = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
