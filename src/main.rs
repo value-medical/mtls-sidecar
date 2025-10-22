@@ -1,20 +1,23 @@
-use std::io;
-use std::net::SocketAddr;
-use std::pin::Pin;
 use anyhow::{Context, Error, Result};
+use bytes::Bytes;
+use http::Request;
+use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 
-use mtls_sidecar::error::DomainError;
+use mtls_sidecar::error::{DomainError, DynError};
+use mtls_sidecar::utils::adapt_request;
 use mtls_sidecar::{config, monitoring, proxy_inbound, tls_manager, watcher};
 use tls_manager::TlsManager;
 
@@ -80,8 +83,6 @@ async fn start_monitoring_server(
     Ok(())
 }
 
-
-
 fn setup_signals() -> Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal), Error> {
     let sigterm = signal(SignalKind::terminate()).context("Failed to register SIGTERM handler")?;
     let sigint = signal(SignalKind::interrupt()).context("Failed to register SIGINT handler")?;
@@ -99,13 +100,12 @@ async fn accept_outbound_connection(stream: TcpStream, tls_manager: Arc<TlsManag
         .enable_http1()
         .enable_http2()
         .build();
-    let client: Arc<Client<HttpsConnector<HttpConnector>, Incoming>> =
-        Arc::new(Client::builder(TokioExecutor::new()).build(https));
+    let client = Arc::new(Client::builder(TokioExecutor::new()).build(https));
 
     // Handle connection
-    let service = service_fn(move |req| {
+    let service = service_fn(move |req: Request<Incoming>| {
         let client = Arc::clone(&client);
-        async move { mtls_sidecar::proxy_outbound::handler(req, client).await }
+        async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), client).await }
     });
     if let Err(err) = auto::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(stream), service)
@@ -120,7 +120,7 @@ async fn accept_inbound_connection(
     tls_manager: Arc<TlsManager>,
     upstream_url: String,
     inject: bool,
-    client: Arc<Client<HttpConnector, Incoming>>,
+    client: Arc<Client<HttpConnector, BoxBody<Bytes, DynError>>>,
 ) {
     let peer_addr = stream.peer_addr().ok();
     let current_config = tls_manager
@@ -147,11 +147,11 @@ async fn accept_inbound_connection(
         .and_then(|certs| certs.first().cloned())
         .and_then(|cert| Some(Arc::new(cert)));
 
-    let service = service_fn(move |req| {
+    let service = service_fn(move |req: Request<Incoming>| {
         let up = upstream_url.clone();
         let cli = Arc::clone(&client);
         let cc = client_cert.clone().and_then(|cert| Some(Arc::clone(&cert)));
-        async move { proxy_inbound::handler(req, &up, inject, cli, peer_addr, cc).await }
+        async move { proxy_inbound::handler(adapt_request(req), &up, inject, cli, peer_addr, cc).await }
     });
 
     if let Err(err) = auto::Builder::new(TokioExecutor::new())
@@ -162,13 +162,16 @@ async fn accept_inbound_connection(
     }
 }
 
-fn maybe_accept(listener: &Option<TcpListener>) -> Pin<Box<dyn futures::Future<Output = io::Result<(TcpStream, SocketAddr)>> + '_>> {
+fn maybe_accept(
+    listener: &Option<TcpListener>,
+) -> Pin<Box<dyn futures::Future<Output = io::Result<(TcpStream, SocketAddr)>> + '_>> {
     match listener {
         Some(l) => Box::pin(l.accept()),
-        None => Box::pin(futures::future::pending::<io::Result<(TcpStream, SocketAddr)>>()),
+        None => Box::pin(futures::future::pending::<
+            io::Result<(TcpStream, SocketAddr)>,
+        >()),
     }
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -196,12 +199,17 @@ async fn main() -> Result<(), Error> {
     let http_client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
     if let Some(inbound_port) = config.tls_listen_port {
         let inbound_addr = format!("0.0.0.0:{}", inbound_port);
-        inbound_listener = Some(TcpListener::bind(&inbound_addr).await.context(format!(
-            "Failed to bind to {}", inbound_addr
-        ))?);
+        inbound_listener = Some(
+            TcpListener::bind(&inbound_addr)
+                .await
+                .context(format!("Failed to bind to {}", inbound_addr))?,
+        );
         tracing::info!("Inbound proxy listening on {}", inbound_addr);
         if upstream_url.is_none() {
-            return Err(DomainError::Config("upstream_url must be set for inbound proxy".to_string()).into());
+            return Err(DomainError::Config(
+                "upstream_url must be set for inbound proxy".to_string(),
+            )
+            .into());
         }
     }
 

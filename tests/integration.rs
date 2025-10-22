@@ -36,6 +36,7 @@ pub mod hello_world {
 
 use hello_world::greeter_server::{Greeter, GreeterServer};
 use hello_world::{HelloReply, HelloRequest};
+use mtls_sidecar::utils::adapt_request;
 
 #[derive(Default)]
 pub struct MyGreeter {}
@@ -98,6 +99,7 @@ fn setup_certificates() -> Result<TestCerts> {
         client_key,
     })
 }
+
 fn generate_ca() -> (rcgen::Certificate, Issuer<'static, KeyPair>) {
     let mut params = CertificateParams::new(vec![]).unwrap();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -141,6 +143,13 @@ fn generate_client_cert(issuer: &Issuer<KeyPair>) -> (rcgen::Certificate, KeyPai
     let key_pair = KeyPair::generate().unwrap();
     let cert = params.signed_by(&key_pair, &issuer).unwrap();
     (cert, key_pair)
+}
+
+fn validity_period() -> (OffsetDateTime, OffsetDateTime) {
+    let now = OffsetDateTime::now_utc();
+    let past = now.checked_sub(Duration::hours(1)).unwrap();
+    let future = now.checked_add(Duration::hours(1)).unwrap();
+    (past, future)
 }
 
 fn create_test_config(
@@ -363,7 +372,7 @@ async fn start_sidecar(
                     let up = upstream.clone();
                     let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
                     let cc = client_cert.clone().and_then(|cert| Some(Arc::clone(&cert)));
-                    async move { mtls_sidecar::proxy_inbound::handler(req, &up, inject, client, peer_addr, cc).await }
+                    async move { mtls_sidecar::proxy_inbound::handler(adapt_request(req), &up, inject, client, peer_addr, cc).await }
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -392,7 +401,6 @@ fn create_client_builder_with_cert(test_certs: &TestCerts) -> Result<reqwest::Cl
 #[tokio::test]
 async fn test_proxy_with_valid_cert() -> Result<()> {
     let setup = setup_basic_proxy_test(Bytes::from("Hello from upstream"), false).await?;
-
     let resp = setup
         .client
         .get(format!("https://localhost:{}/", setup.sidecar_port))
@@ -590,7 +598,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                         Arc::new(Client::builder(TokioExecutor::new()).build_http())
                     };
                     let cc = client_cert.clone().and_then(|cert| Some(Arc::clone(&cert)));
-                    async move { mtls_sidecar::proxy_inbound::handler(req, &up, false, client, peer_addr, cc).await }
+                    async move { mtls_sidecar::proxy_inbound::handler(adapt_request(req), &up, false, client, peer_addr, cc).await }
                 });
                 auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -946,7 +954,8 @@ async fn test_outbound_proxy_with_valid_certs() -> Result<()> {
     // Start outbound proxy listener
     let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
     let outbound_listener = TcpListener::bind(&outbound_addr).await?;
-    let outbound_client = Arc::new(new_outbound_client(Arc::new(tls_manager)).await);
+    let outbound_client = new_outbound_client(Arc::new(tls_manager)).await;
+    let outbound_client = Arc::new(outbound_client);
     tokio::spawn(async move {
         loop {
             let (stream, _) = outbound_listener.accept().await.unwrap();
@@ -954,7 +963,7 @@ async fn test_outbound_proxy_with_valid_certs() -> Result<()> {
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let outbound_client = Arc::clone(&outbound_client);
-                    async move { mtls_sidecar::proxy_outbound::handler(req, outbound_client).await }
+                    async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), outbound_client).await }
                 });
                 if let Err(err) = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -1036,7 +1045,8 @@ async fn test_outbound_proxy_with_invalid_server_cert() -> Result<()> {
     // Start outbound proxy listener
     let outbound_addr = format!("127.0.0.1:{}", outbound_proxy_port);
     let outbound_listener = TcpListener::bind(&outbound_addr).await?;
-    let outbound_client = Arc::new(new_outbound_client(Arc::clone(&tls_manager)).await);
+    let outbound_client = new_outbound_client(Arc::clone(&tls_manager)).await;
+    let outbound_client = Arc::new(outbound_client);
     tokio::spawn(async move {
         loop {
             let (stream, _) = outbound_listener.accept().await.unwrap();
@@ -1044,7 +1054,7 @@ async fn test_outbound_proxy_with_invalid_server_cert() -> Result<()> {
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let outbound_client = Arc::clone(&outbound_client);
-                    async move { mtls_sidecar::proxy_outbound::handler(req, outbound_client).await }
+                    async move { mtls_sidecar::proxy_outbound::handler(adapt_request(req), outbound_client).await }
                 });
                 if let Err(err) = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -1106,12 +1116,4 @@ async fn test_outbound_proxy_with_missing_client_cert() -> Result<()> {
     assert!(result.is_err());
 
     Ok(())
-}
-
-
-fn validity_period() -> (OffsetDateTime, OffsetDateTime) {
-    let now = OffsetDateTime::now_utc();
-    let past = now.checked_sub(Duration::hours(1)).unwrap();
-    let future = now.checked_add(Duration::hours(1)).unwrap();
-    (past, future)
 }

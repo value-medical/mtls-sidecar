@@ -1,32 +1,25 @@
+use crate::error::DynError;
 use crate::header_filter;
-use anyhow::Result;
+use crate::http_client_like::HttpClientLike;
+use anyhow::{Error, Result};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::header::HOST;
-use hyper::{http::uri::Scheme, http::Uri, Request, Response, StatusCode};
-use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use std::error::Error;
-use std::sync::Arc;
+use hyper::http::uri::Scheme;
+use hyper::http::{Request, Response, StatusCode, Uri};
 
-pub async fn handler<B>(
-    req: Request<B>,
-    client: Arc<Client<HttpsConnector<HttpConnector>, B>>,
-) -> Result<Response<BoxBody<Bytes, hyper::Error>>>
-where
-    B: hyper::body::Body + Send + 'static + Unpin,
-    B::Data: Send,
-    B::Error: Into<Box<dyn Error + Send + Sync>>,
-{
+pub async fn handler(
+    req: Request<BoxBody<Bytes, DynError>>,
+    client: impl HttpClientLike,
+) -> Result<Response<BoxBody<Bytes, DynError>>> {
     let (parts, body) = req.into_parts();
 
     if parts.method == hyper::Method::CONNECT {
         // Do we want to handle CONNECT?
-        let bad_request_full = Full::new(Bytes::from("CONNECT method not supported"))
-            .map_err(|_| unreachable!());
-        let bad_request_body: BoxBody<Bytes, hyper::Error> = BoxBody::new(bad_request_full);
+        let bad_request_body = BoxBody::new(
+            Full::new(Bytes::from("CONNECT method not supported")).map_err(Into::<DynError>::into),
+        );
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(bad_request_body)?);
@@ -34,8 +27,8 @@ where
 
     // Reject the request if the Upgrade header is present -- currently unsupported.
     if parts.headers.contains_key("upgrade") {
-        let bad_request_full = Full::new(Bytes::from("Bad Request")).map_err(|_| unreachable!());
-        let bad_request_body: BoxBody<Bytes, hyper::Error> = BoxBody::new(bad_request_full);
+        let bad_request_body =
+            BoxBody::new(Full::new(Bytes::from("Bad Request")).map_err(Into::<DynError>::into));
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(bad_request_body)?);
@@ -44,9 +37,9 @@ where
     // Parse the target URI from the request
     let target_uri = parts.uri.clone();
     if target_uri.scheme() != Some(&Scheme::HTTP) {
-        let bad_request_full =
-            Full::new(Bytes::from("Only HTTP requests supported")).map_err(|_| unreachable!());
-        let bad_request_body: BoxBody<Bytes, hyper::Error> = BoxBody::new(bad_request_full);
+        let bad_request_body = BoxBody::new(
+            Full::new(Bytes::from("Only HTTP requests supported")).map_err(Into::<DynError>::into),
+        );
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(bad_request_body)?);
@@ -88,7 +81,10 @@ where
     let upstream_req = upstream_req_builder
         .body(body)
         .map_err(|e| anyhow::anyhow!(e))?;
-    let resp = client.request(upstream_req).await?;
+    let resp = client
+        .request(upstream_req)
+        .await
+        .map_err(Error::from_boxed)?;
 
     tracing::info!(
         "Proxied outbound request {} {}",
@@ -117,18 +113,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::Empty;
     use hyper::Request;
+    use hyper_util::client::legacy::Client;
     use hyper_util::rt::TokioExecutor;
-    use rustls::RootCertStore;
+    use rustls::{ClientConfig, RootCertStore};
     use std::sync::Arc;
 
-    fn new_client<B>() -> Arc<Client<HttpsConnector<HttpConnector>, B>>
-    where
-        B: hyper::body::Body + Send + 'static + Unpin,
-        B::Data: Send,
-        B::Error: Into<Box<dyn Error + Send + Sync>>,
-    {
-        let client_config = rustls::ClientConfig::builder()
+    fn new_client() -> Arc<impl HttpClientLike> {
+        let client_config = ClientConfig::builder()
             .with_root_certificates(RootCertStore::empty())
             .with_no_client_auth();
         let https = hyper_rustls::HttpsConnectorBuilder::new()
@@ -136,16 +129,20 @@ mod tests {
             .https_only()
             .enable_http1()
             .build();
-        Arc::new(Client::builder(TokioExecutor::new()).build(https))
+        let client = Client::builder(TokioExecutor::new()).build(https);
+        Arc::new(client)
     }
 
     #[tokio::test]
     async fn test_handler_invalid_scheme() {
         // The outbound proxy should reject non-HTTP requests
         let req = Request::get("https://example.com")
-            .body(http_body_util::Empty::<Bytes>::new())
+            .body(BoxBody::new(
+                Empty::<Bytes>::new().map_err(Into::<DynError>::into),
+            ))
             .unwrap();
-        let result = handler(req, new_client()).await;
+        let client = new_client();
+        let result = handler(req, client).await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert_eq!(resp.status(), 400);

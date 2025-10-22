@@ -1,4 +1,4 @@
-use crate::error::DomainError;
+use crate::error::{DomainError, DynError};
 use anyhow::{Error, Result};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -9,27 +9,26 @@ use std::sync::Arc;
 
 use crate::client_cert;
 use crate::header_filter;
-use crate::http_client_like::{BodyError, HttpClientLike, ProxiedBody};
+use crate::http_client_like::HttpClientLike;
 use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
 
-pub async fn handler<B, C>(
-    req: Request<B>,
+pub async fn handler<C>(
+    req: Request<BoxBody<Bytes, DynError>>,
     upstream_url: &str,
     inject_client_headers: bool,
     client: C,
     client_addr: Option<std::net::SocketAddr>,
     client_cert: Option<Arc<rustls::pki_types::CertificateDer<'static>>>,
-) -> Result<Response<ProxiedBody>, Error>
+) -> Result<Response<BoxBody<Bytes, DynError>>, Error>
 where
-    C: HttpClientLike<B>,
+    C: HttpClientLike,
 {
     let (parts, body) = req.into_parts();
 
     // Reject the request if the Upgrade header is present -- currently unsupported.
     if parts.headers.contains_key("upgrade") {
-        let bad_request_full =
-            Full::new(Bytes::from("Bad Request")).map_err(Into::<BodyError>::into);
-        let bad_request_body: ProxiedBody = BoxBody::new(bad_request_full);
+        let bad_request_body =
+            BoxBody::new(Full::new(Bytes::from("Bad Request")).map_err(Into::<DynError>::into));
         return Ok(Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(bad_request_body)?);
@@ -40,9 +39,8 @@ where
         tracing::warn!("Missing client certificate");
         // No cert, return 401
         MTLS_FAILURES_TOTAL.inc();
-        let unauthorized_full =
-            Full::new(Bytes::from("Unauthorized")).map_err(Into::<BodyError>::into);
-        let unauthorized_body: ProxiedBody = BoxBody::new(unauthorized_full);
+        let unauthorized_body =
+            BoxBody::new(Full::new(Bytes::from("Unauthorized")).map_err(Into::<DynError>::into));
         return Ok(Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .body(unauthorized_body)?);
@@ -128,58 +126,48 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http_client_like::ResponseFutureLike;
     use base64;
     use base64::Engine;
     use http_body_util::Empty;
     use rcgen::{CertificateParams, DnType, KeyPair};
     use serde_json::Value;
-    use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
 
+    #[derive(Clone)]
     struct MockClient;
 
-    impl<B> HttpClientLike<B> for MockClient {
+    impl HttpClientLike for MockClient {
         fn request(
             &self,
-            _req: Request<B>,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<Response<ProxiedBody>, hyper_util::client::legacy::Error>,
-                    > + Send,
-            >,
-        > {
+            _req: Request<BoxBody<Bytes, DynError>>,
+        ) -> Pin<Box<dyn ResponseFutureLike>> {
             Box::pin(std::future::ready({
-                let body = Full::new(Bytes::from("OK")).map_err(Into::<BodyError>::into);
-                let proxied_body = BoxBody::new(body);
-                Ok(Response::builder().status(200).body(proxied_body).unwrap())
+                let body =
+                    BoxBody::new(Full::new(Bytes::from("OK")).map_err(Into::<DynError>::into));
+                Ok(Response::builder().status(200).body(body).unwrap())
             }))
         }
     }
 
+    #[derive(Clone)]
     struct CapturingClient {
         captured_headers: Arc<Mutex<Vec<(String, String)>>>,
     }
 
-    impl<B> HttpClientLike<B> for CapturingClient {
+    impl HttpClientLike for CapturingClient {
         fn request(
             &self,
-            req: Request<B>,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<Response<ProxiedBody>, hyper_util::client::legacy::Error>,
-                    > + Send,
-            >,
-        > {
+            req: Request<BoxBody<Bytes, DynError>>,
+        ) -> Pin<Box<dyn ResponseFutureLike>> {
             let mut headers = Vec::new();
             for (k, v) in req.headers() {
                 headers.push((k.as_str().to_lowercase(), v.to_str().unwrap().to_string()));
             }
             *self.captured_headers.lock().unwrap() = headers;
             Box::pin(std::future::ready({
-                let body = Full::new(Bytes::from("OK")).map_err(Into::<BodyError>::into);
+                let body = Full::new(Bytes::from("OK")).map_err(Into::<DynError>::into);
                 let proxied_body = BoxBody::new(body);
                 Ok(Response::builder().status(200).body(proxied_body).unwrap())
             }))
@@ -188,7 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_missing_cert() {
-        let req = Request::new(Empty::<Bytes>::new());
+        let req = Request::new(BoxBody::new(Empty::<Bytes>::new().map_err(Into::<DynError>::into)));
         let resp = handler(req, "http://localhost:8080", false, MockClient, None, None)
             .await
             .unwrap();
@@ -209,8 +197,16 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
 
-        let req = Request::new(Empty::<Bytes>::new());
-        let result = handler(req, "http://localhost:8080", false, MockClient, None, Some(Arc::new(cert_der))).await;
+        let req = Request::new(BoxBody::new(Empty::<Bytes>::new().map_err(Into::<DynError>::into)));
+        let result = handler(
+            req,
+            "http://localhost:8080",
+            false,
+            MockClient,
+            None,
+            Some(Arc::new(cert_der)),
+        )
+        .await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -223,7 +219,7 @@ mod tests {
             captured_headers: captured.clone(),
         };
 
-        let mut req = Request::new(Empty::<Bytes>::new());
+        let mut req = Request::new(BoxBody::new(Empty::<Bytes>::new().map_err(Into::<DynError>::into)));
         req.headers_mut()
             .insert("x-client-test", "value".parse().unwrap());
         req.headers_mut()
@@ -238,7 +234,15 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
 
-        let result = handler(req, "http://localhost:8080", false, client, None, Some(Arc::new(cert_der))).await;
+        let result = handler(
+            req,
+            "http://localhost:8080",
+            false,
+            client,
+            None,
+            Some(Arc::new(cert_der)),
+        )
+        .await;
         assert!(result.is_ok());
 
         let captured_headers = captured.lock().unwrap();
@@ -257,7 +261,7 @@ mod tests {
             captured_headers: captured.clone(),
         };
 
-        let mut req = Request::new(Empty::<Bytes>::new());
+        let mut req = Request::new(BoxBody::new(Empty::<Bytes>::new().map_err(Into::<DynError>::into)));
         req.headers_mut()
             .insert("x-client-test", "value".parse().unwrap());
 
@@ -273,7 +277,15 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
 
-        let result = handler(req, "http://localhost:8080", true, client, None, Some(Arc::new(cert_der))).await;
+        let result = handler(
+            req,
+            "http://localhost:8080",
+            true,
+            client,
+            None,
+            Some(Arc::new(cert_der)),
+        )
+        .await;
         assert!(result.is_ok());
 
         let captured_headers = captured.lock().unwrap();
