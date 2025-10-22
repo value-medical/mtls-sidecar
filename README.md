@@ -24,6 +24,7 @@ proxy for secure outbound connections.
 - Outbound mTLS forward proxy:
   - Accepts HTTP connections on a separate port (bound to `localhost`).
   - Forwards requests for HTTPS addresses, authenticating with client certificates and verifying server identity against the CA bundle.
+  - Supports CONNECT method and Upgrade requests.
 - Hot-reloads TLS configuration on file changes.
   - Supports both `kubernetes.io/tls` and VSO Opaque Secret formats via file auto-detection.
 - Supports HTTP/1.1 and HTTP/2 proxying, enabling mTLS termination for gRPC services.
