@@ -33,7 +33,7 @@ pub fn create_router(config: Arc<Config>, tls_manager: Arc<TlsManager>) -> Route
 }
 
 async fn live_handler() -> &'static str {
-    tracing::info!("Liveness probe called");
+    // tracing::info!("Liveness probe called");
     "OK"
 }
 
@@ -50,7 +50,7 @@ async fn check_certificate_expiry(tls_manager: &TlsManager) -> Result<(), ()> {
 }
 
 async fn ready_handler(tls_manager: Arc<TlsManager>) -> Result<&'static str, StatusCode> {
-    tracing::info!("Readiness probe called");
+    // tracing::info!("Readiness probe called");
 
     // Check certificate expiry
     if let Err(_) = check_certificate_expiry(&tls_manager).await {
