@@ -20,6 +20,14 @@ pub async fn handler(
     client: impl HttpClientLike,
     client_config: Arc<ClientConfig>,
 ) -> Result<Response<BoxBody<Bytes, DynError>>> {
+    let span = tracing::span!(
+        tracing::Level::INFO,
+        "proxy_outbound_handler",
+        method = %req.method(),
+        uri = %req.uri()
+    );
+    let _enter = span.enter();
+    tracing::debug!("Detected CONNECT request for tunneling");
     if req.method() == Method::CONNECT {
         // Handle CONNECT tunneling
         let uri = req.uri().clone();
@@ -29,12 +37,16 @@ pub async fn handler(
         let host = authority.host().to_string();
         let port = authority.port_u16().unwrap_or(443);
         let target_addr = format!("{}:{}", host, port);
+        tracing::debug!("Built target address for CONNECT: {}", target_addr);
 
         // Establish TLS connection to target
         let tcp_stream = TcpStream::connect(&target_addr).await?;
+        tracing::debug!("Established TCP connection to {}", target_addr);
         let connector = TlsConnector::from(client_config);
-        let mut tls_stream = connector.connect(host.try_into()?, tcp_stream).await?;
+        let mut tls_stream = connector.connect(host.clone().try_into()?, tcp_stream).await?;
+        tracing::debug!("Established TLS connection to {}", host);
 
+        tracing::debug!("Spawning async task for CONNECT tunnel");
         // Start bidirectional tunnel
         tokio::task::spawn(async move {
             match hyper::upgrade::on(&mut req).await {
@@ -63,10 +75,13 @@ pub async fn handler(
             .body(BoxBody::new(Empty::new().map_err(Into::<DynError>::into)))?);
     }
 
+    tracing::debug!("Checking for UPGRADE header");
     if req.headers().contains_key(UPGRADE) {
+        tracing::debug!("Detected UPGRADE request");
         // Handle Upgrade request
         let target_uri = req.uri().clone();
         if target_uri.scheme().is_some() && target_uri.scheme() != Some(&Scheme::HTTP) {
+            tracing::debug!("Rejecting non-HTTP UPGRADE request with scheme {:?}", target_uri.scheme());
             let bad_request_body = BoxBody::new(
                 Full::new(Bytes::from("Only HTTP requests supported"))
                     .map_err(Into::<DynError>::into),
@@ -88,6 +103,7 @@ pub async fn handler(
         let https_uri: Uri = https_uri_str
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
+        tracing::debug!("Built HTTPS URI for UPGRADE: {}", https_uri);
 
         // Build upstream request
         let mut upstream_req_builder = Request::builder()
@@ -107,13 +123,16 @@ pub async fn handler(
             host.to_string()
         };
         upstream_req_builder = upstream_req_builder.header(HOST, host_header);
+        tracing::debug!("Built upstream request for UPGRADE");
 
         let upstream_req = upstream_req_builder
             .body(BoxBody::new(Empty::new().map_err(Into::<DynError>::into)))?;
+        tracing::debug!("Sending UPGRADE request to upstream");
         let resp = client
             .request(upstream_req)
             .await
             .map_err(Error::from_boxed)?;
+        tracing::debug!("Received response for UPGRADE: status {}", resp.status());
         if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
             return Ok(resp);
         }
@@ -126,6 +145,7 @@ pub async fn handler(
         );
         let resp = Response::from_parts(parts, body);
 
+        tracing::debug!("Spawning async task for UPGRADE tunnel");
         tokio::task::spawn(async move {
             // Upgrade the request first
             match hyper::upgrade::on(req).await {
@@ -158,11 +178,14 @@ pub async fn handler(
         return Ok(response);
     }
 
+    tracing::debug!("Handling regular HTTP proxy request");
     let (parts, body) = req.into_parts();
 
     // Parse the target URI from the request
     let target_uri = parts.uri.clone();
+    tracing::debug!("Validating target URI scheme: {:?}", target_uri.scheme());
     if target_uri.scheme() != Some(&Scheme::HTTP) {
+        tracing::debug!("Rejecting non-HTTP proxy request with scheme {:?}", target_uri.scheme());
         let bad_request_body = BoxBody::new(
             Full::new(Bytes::from("Only HTTP requests supported")).map_err(Into::<DynError>::into),
         );
@@ -183,6 +206,7 @@ pub async fn handler(
     let https_uri: Uri = https_uri_str
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?;
+    tracing::debug!("Built HTTPS URI for proxy: {}", https_uri);
 
     // Build upstream request
     let mut upstream_req_builder = Request::builder()
@@ -202,15 +226,18 @@ pub async fn handler(
         host.to_string()
     };
     upstream_req_builder = upstream_req_builder.header(HOST, host_header);
+    tracing::debug!("Built upstream request for proxy");
 
     // Send request
     let upstream_req = upstream_req_builder
         .body(body)
         .map_err(|e| anyhow::anyhow!(e))?;
+    tracing::debug!("Sending proxy request to upstream");
     let resp = client
         .request(upstream_req)
         .await
         .map_err(Error::from_boxed)?;
+    tracing::debug!("Received response for proxy: status {}", resp.status());
 
     tracing::info!(
         "Proxied outbound request {} {}",
@@ -218,6 +245,7 @@ pub async fn handler(
         https_uri
     );
 
+    tracing::debug!("Forwarding response to client");
     // Forward response
     let (parts, body) = resp.into_parts();
     let proxied_body = body;
