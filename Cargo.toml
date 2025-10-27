@@ -48,6 +48,7 @@ tonic = { version = "0.14", default-features = false, features = ["transport", "
 prost = "0.14"
 tonic-prost = "0.14.2"
 tokio-stream = "0.1"
+clap = { version = "4.0", features = ["derive"] }
 
 [[bench]]
 name = "benchmark"
@@ -57,4 +58,8 @@ path = "benchmark/benchmark.rs"
 [profile.release]
 lto = true
 codegen-units = 1
-debug = "line-tables-only"
+
+[profile.bench]
+lto = true
+codegen-units = 1
+debug = true

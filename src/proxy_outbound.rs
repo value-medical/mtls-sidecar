@@ -1,6 +1,12 @@
 use crate::error::DynError;
 use crate::header_filter;
 use crate::http_client_like::HttpClientLike;
+use crate::monitoring::{
+    OUTBOUND_BYTES_RECEIVED_TOTAL, OUTBOUND_BYTES_SENT_TOTAL, OUTBOUND_CONNECT_DURATION,
+    OUTBOUND_CONNECT_FAILURE_TOTAL, OUTBOUND_CONNECT_SUCCESS_TOTAL, OUTBOUND_REQUESTS_TOTAL,
+    OUTBOUND_REQUEST_FAILURES_TOTAL, OUTBOUND_UPGRADE_DURATION, OUTBOUND_UPGRADE_FAILURE_TOTAL,
+    OUTBOUND_UPGRADE_SUCCESS_TOTAL,
+};
 use anyhow::{Error, Result};
 use bytes::Bytes;
 use http::header::UPGRADE;
@@ -13,6 +19,7 @@ use hyper_util::rt::TokioIo;
 use rustls::ClientConfig;
 use std::sync::Arc;
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
 pub async fn handler(
@@ -40,20 +47,38 @@ pub async fn handler(
         tracing::debug!("Built target address for CONNECT: {}", target_addr);
 
         // Establish TLS connection to target
-        let tcp_stream = TcpStream::connect(&target_addr).await?;
+        let tcp_stream = match TcpStream::connect(&target_addr).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                OUTBOUND_CONNECT_FAILURE_TOTAL.inc();
+                return Err(e.into());
+            }
+        };
         tracing::debug!("Established TCP connection to {}", target_addr);
         let connector = TlsConnector::from(client_config);
-        let mut tls_stream = connector.connect(host.clone().try_into()?, tcp_stream).await?;
+        let mut tls_stream = match connector.connect(host.clone().try_into()?, tcp_stream).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                OUTBOUND_CONNECT_FAILURE_TOTAL.inc();
+                return Err(e.into());
+            }
+        };
         tracing::debug!("Established TLS connection to {}", host);
+        OUTBOUND_CONNECT_SUCCESS_TOTAL.inc();
 
         tracing::debug!("Spawning async task for CONNECT tunnel");
         // Start bidirectional tunnel
         tokio::task::spawn(async move {
+            let start = Instant::now();
             match hyper::upgrade::on(&mut req).await {
                 Ok(upgraded) => {
                     let mut client = TokioIo::new(upgraded);
                     match tokio::io::copy_bidirectional(&mut client, &mut tls_stream).await {
                         Ok((up_bytes, down_bytes)) => {
+                            let duration = start.elapsed().as_secs_f64();
+                            OUTBOUND_CONNECT_DURATION.observe(duration);
+                            OUTBOUND_BYTES_SENT_TOTAL.inc_by(up_bytes);
+                            OUTBOUND_BYTES_RECEIVED_TOTAL.inc_by(down_bytes);
                             tracing::info!(
                                 "CONNECT completed, {} bytes sent, {} bytes received",
                                 up_bytes,
@@ -61,11 +86,17 @@ pub async fn handler(
                             )
                         }
                         Err(e) => {
+                            let duration = start.elapsed().as_secs_f64();
+                            OUTBOUND_CONNECT_DURATION.observe(duration);
                             tracing::info!("CONNECT completed with error {}", e.to_string())
                         }
                     }
                 }
-                Err(e) => tracing::error!("Upgrade error: {}", e),
+                Err(e) => {
+                    let duration = start.elapsed().as_secs_f64();
+                    OUTBOUND_CONNECT_DURATION.observe(duration);
+                    tracing::error!("Upgrade error: {}", e)
+                },
             }
         });
 
@@ -128,14 +159,18 @@ pub async fn handler(
         let upstream_req = upstream_req_builder
             .body(BoxBody::new(Empty::new().map_err(Into::<DynError>::into)))?;
         tracing::debug!("Sending UPGRADE request to upstream");
-        let resp = client
-            .request(upstream_req)
-            .await
-            .map_err(Error::from_boxed)?;
+        let resp = match client.request(upstream_req).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                OUTBOUND_UPGRADE_FAILURE_TOTAL.inc();
+                return Err(Error::from_boxed(e));
+            }
+        };
         tracing::debug!("Received response for UPGRADE: status {}", resp.status());
         if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
             return Ok(resp);
         }
+        OUTBOUND_UPGRADE_SUCCESS_TOTAL.inc();
 
         // Handle upgrade
         let (parts, body) = resp.into_parts();
@@ -147,6 +182,7 @@ pub async fn handler(
 
         tracing::debug!("Spawning async task for UPGRADE tunnel");
         tokio::task::spawn(async move {
+            let start = Instant::now();
             // Upgrade the request first
             match hyper::upgrade::on(req).await {
                 Ok(upgraded_req) => match hyper::upgrade::on(resp).await {
@@ -155,6 +191,10 @@ pub async fn handler(
                         let mut res_io = TokioIo::new(upgraded_res);
                         match tokio::io::copy_bidirectional(&mut req_io, &mut res_io).await {
                             Ok((up_bytes, down_bytes)) => {
+                                let duration = start.elapsed().as_secs_f64();
+                                OUTBOUND_UPGRADE_DURATION.observe(duration);
+                                OUTBOUND_BYTES_SENT_TOTAL.inc_by(up_bytes);
+                                OUTBOUND_BYTES_RECEIVED_TOTAL.inc_by(down_bytes);
                                 tracing::info!(
                                     "Upgrade completed, {} bytes sent, {} bytes received",
                                     up_bytes,
@@ -162,15 +202,23 @@ pub async fn handler(
                                 )
                             }
                             Err(e) => {
+                                let duration = start.elapsed().as_secs_f64();
+                                OUTBOUND_UPGRADE_DURATION.observe(duration);
                                 tracing::info!("Upgrade completed with error {}", e.to_string())
                             }
                         }
                     }
                     Err(e) => {
+                        let duration = start.elapsed().as_secs_f64();
+                        OUTBOUND_UPGRADE_DURATION.observe(duration);
                         tracing::info!("Response upgrade failed with error {}", e.to_string())
                     }
                 },
-                Err(e) => tracing::info!("Request upgrade failed with error {}", e.to_string()),
+                Err(e) => {
+                    let duration = start.elapsed().as_secs_f64();
+                    OUTBOUND_UPGRADE_DURATION.observe(duration);
+                    tracing::info!("Request upgrade failed with error {}", e.to_string())
+                },
             }
         });
 
@@ -233,10 +281,16 @@ pub async fn handler(
         .body(body)
         .map_err(|e| anyhow::anyhow!(e))?;
     tracing::debug!("Sending proxy request to upstream");
-    let resp = client
-        .request(upstream_req)
-        .await
-        .map_err(Error::from_boxed)?;
+    let resp = match client.request(upstream_req).await {
+        Ok(resp) => {
+            OUTBOUND_REQUESTS_TOTAL.inc();
+            resp
+        }
+        Err(e) => {
+            OUTBOUND_REQUEST_FAILURES_TOTAL.inc();
+            return Err(Error::from_boxed(e));
+        }
+    };
     tracing::debug!("Received response for proxy: status {}", resp.status());
 
     tracing::info!(

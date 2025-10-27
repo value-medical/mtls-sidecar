@@ -3,7 +3,7 @@ use crate::tls_manager::TlsManager;
 use axum::{http::StatusCode, routing::get, Router};
 use chrono::Utc;
 use lazy_static::lazy_static;
-use prometheus::{register_int_counter, Encoder, IntCounter, TextEncoder};
+use prometheus::{register_histogram, register_int_counter, Encoder, Histogram, IntCounter, TextEncoder};
 use std::sync::Arc;
 
 lazy_static! {
@@ -16,6 +16,53 @@ lazy_static! {
     .unwrap();
     pub static ref REQUESTS_TOTAL: IntCounter =
         register_int_counter!("requests_total", "Total number of proxied requests").unwrap();
+    pub static ref OUTBOUND_REQUESTS_TOTAL: IntCounter =
+        register_int_counter!("outbound_requests_total", "Total number of outbound proxy requests").unwrap();
+    pub static ref OUTBOUND_REQUEST_FAILURES_TOTAL: IntCounter = register_int_counter!(
+        "outbound_request_failures_total",
+        "Total number of failed outbound proxy requests"
+    )
+    .unwrap();
+    pub static ref OUTBOUND_CONNECT_SUCCESS_TOTAL: IntCounter = register_int_counter!(
+        "outbound_connect_success_total",
+        "Total number of successful CONNECT tunnels"
+    )
+    .unwrap();
+    pub static ref OUTBOUND_CONNECT_FAILURE_TOTAL: IntCounter = register_int_counter!(
+        "outbound_connect_failure_total",
+        "Total number of failed CONNECT attempts"
+    )
+    .unwrap();
+    pub static ref OUTBOUND_UPGRADE_SUCCESS_TOTAL: IntCounter = register_int_counter!(
+        "outbound_upgrade_success_total",
+        "Total number of successful UPGRADE tunnels"
+    )
+    .unwrap();
+    pub static ref OUTBOUND_UPGRADE_FAILURE_TOTAL: IntCounter = register_int_counter!(
+        "outbound_upgrade_failure_total",
+        "Total number of failed UPGRADE attempts"
+    )
+    .unwrap();
+    pub static ref OUTBOUND_BYTES_SENT_TOTAL: IntCounter = register_int_counter!(
+        "outbound_bytes_sent_total",
+        "Total bytes sent in outbound tunnels"
+    )
+    .unwrap();
+    pub static ref OUTBOUND_BYTES_RECEIVED_TOTAL: IntCounter = register_int_counter!(
+        "outbound_bytes_received_total",
+        "Total bytes received in outbound tunnels"
+    )
+    .unwrap();
+    pub static ref OUTBOUND_CONNECT_DURATION: Histogram = register_histogram!(
+        "outbound_connect_duration_seconds",
+        "Duration of CONNECT tunnels in seconds"
+    )
+    .unwrap();
+    pub static ref OUTBOUND_UPGRADE_DURATION: Histogram = register_histogram!(
+        "outbound_upgrade_duration_seconds",
+        "Duration of UPGRADE tunnels in seconds"
+    )
+    .unwrap();
 }
 
 pub fn create_router(config: Arc<Config>, tls_manager: Arc<TlsManager>) -> Router {
