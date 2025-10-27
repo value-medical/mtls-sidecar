@@ -1,14 +1,15 @@
 use anyhow::Result;
 use bytes::Bytes;
+use clap::Parser;
 use http_body_util::Full;
 use hyper::service::service_fn;
-use hyper::{Response};
+use hyper::Response;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use portpicker;
 use rcgen::{CertificateParams, DnType, Issuer, KeyPair};
 use reqwest::Certificate;
-use std::process::{Command};
+use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
 use time::Duration as TimeDuration;
@@ -16,8 +17,34 @@ use time::OffsetDateTime;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
+#[derive(Parser)]
+#[command(author, version, about = "Benchmark the mTLS sidecar")]
+struct Args {
+    /// Enable profiling with flamegraph
+    #[arg(long)]
+    profile: bool,
+
+    /// Number of benchmark runs
+    #[arg(long, default_value_t = 3)]
+    runs: usize,
+
+    /// Number of concurrent clients
+    #[arg(long, default_value_t = 100)]
+    clients: usize,
+
+    /// Requests per second per client
+    #[arg(long, default_value_t = 10.0)]
+    rps: f64,
+
+    /// Bench name (ignored, for Cargo compatibility)
+    #[arg(long)]
+    bench: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     println!("Starting mTLS sidecar benchmark...");
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
         .expect("Failed to install rustls crypto provider");
@@ -32,20 +59,32 @@ async fn main() -> Result<()> {
     }
 
     let mut results = Vec::new();
-    let num_runs = 3;
+    let num_runs = args.runs;
     for run in 1..=num_runs {
         println!("Running benchmark iteration {}/{}", run, num_runs);
-        let result = run_benchmark().await?;
-        println!("Iteration {} completed: RAM avg {:.1}MB peak {:.1}MB, CPU avg {:.1}% peak {:.1}%",
-                 run, result.avg_ram_mb, result.peak_ram_mb, result.avg_cpu, result.peak_cpu);
+        let result = run_benchmark(&args).await?;
+        println!(
+            "Iteration {} completed: RAM avg {:.1}MB peak {:.1}MB, CPU avg {:.1}% peak {:.1}%",
+            run, result.avg_ram_mb, result.peak_ram_mb, result.avg_cpu, result.peak_cpu
+        );
         results.push(result);
     }
 
     // Calculate averages
-    let avg_ram = results.iter().map(|r| r.avg_ram_mb).sum::<f64>() / <i32 as Into<f64>>::into(num_runs);
-    let peak_ram = results.iter().map(|r| r.peak_ram_mb).max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
-    let avg_cpu = results.iter().map(|r| r.avg_cpu).sum::<f64>() / <i32 as Into<f64>>::into(num_runs);
-    let peak_cpu = results.iter().map(|r| r.peak_cpu).max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap();
+    let avg_ram =
+        results.iter().map(|r| r.avg_ram_mb).sum::<f64>() / num_runs as f64;
+    let peak_ram = results
+        .iter()
+        .map(|r| r.peak_ram_mb)
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap();
+    let avg_cpu =
+        results.iter().map(|r| r.avg_cpu).sum::<f64>() / num_runs as f64;
+    let peak_cpu = results
+        .iter()
+        .map(|r| r.peak_cpu)
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap();
 
     println!("\nBenchmark Results (averaged over {} runs):", num_runs);
     println!("Average RAM: {:.1} MB", avg_ram);
@@ -66,8 +105,8 @@ struct BenchmarkResult {
     peak_cpu: f64,
 }
 
-async fn run_benchmark() -> Result<BenchmarkResult> {
-    let duration_seconds = 30;
+async fn run_benchmark(args: &Args) -> Result<BenchmarkResult> {
+    let duration_seconds = 30.0;
 
     // Pick ports
     let upstream_port = portpicker::pick_unused_port().expect("No free port");
@@ -104,8 +143,14 @@ async fn run_benchmark() -> Result<BenchmarkResult> {
     let ca_dir_str = ca_dir.to_str().unwrap().to_string();
     let mut sidecar_cmd = Command::new("./target/release/mtls-sidecar")
         .env("TLS_LISTEN_PORT", sidecar_port.to_string())
-        .env("UPSTREAM_URL", format!("http://127.0.0.1:{}", upstream_port))
-        .env("UPSTREAM_READINESS_URL", format!("http://127.0.0.1:{}/ready", upstream_port))
+        .env(
+            "UPSTREAM_URL",
+            format!("http://127.0.0.1:{}", upstream_port),
+        )
+        .env(
+            "UPSTREAM_READINESS_URL",
+            format!("http://127.0.0.1:{}/ready", upstream_port),
+        )
         .env("SERVER_CERT_DIR", &cert_dir_str)
         .env("CA_DIR", &ca_dir_str)
         .env("INJECT_CLIENT_HEADERS", "false")
@@ -117,7 +162,8 @@ async fn run_benchmark() -> Result<BenchmarkResult> {
     // Wait for sidecar to be ready
     let readiness_url = format!("http://127.0.0.1:{}/ready", monitor_port);
     let client = reqwest::Client::new();
-    for _ in 0..5 {  // wait up to 5 seconds
+    for _ in 0..5 {
+        // wait up to 5 seconds
         if let Ok(resp) = client.get(&readiness_url).send().await {
             if resp.status() == 200 {
                 break;
@@ -126,18 +172,42 @@ async fn run_benchmark() -> Result<BenchmarkResult> {
         sleep(Duration::from_secs(1)).await;
     }
 
+    // Start flamegraph if profiling enabled
+    let flamegraph_cmd = if args.profile {
+        Some(Command::new("flamegraph")
+            .args(&["--pid", &sidecar_pid.to_string()])
+            .spawn()?)
+    } else {
+        None
+    };
+
     // Start monitoring
     let monitor_handle = tokio::spawn(monitor_process(sidecar_pid, duration_seconds));
 
     // Run load test for 60 seconds
     println!("Starting load test...");
-    let load_test_result = run_load_test(sidecar_port, &client_cert_path, &client_key_path, &ca_dir, duration_seconds).await;
+    let load_test_result = run_load_test(
+        sidecar_port,
+        &client_cert_path,
+        &client_key_path,
+        &ca_dir,
+        duration_seconds,
+        args.clients,
+        args.rps,
+    )
+    .await;
     if let Err(e) = load_test_result {
         eprintln!("Load test failed: {}", e);
     }
 
     // Stop monitoring
     monitor_handle.abort();
+
+    // Stop flamegraph if running
+    if let Some(mut cmd) = flamegraph_cmd {
+        let _ = cmd.kill();
+        let _ = cmd.wait();
+    }
 
     // Stop sidecar process
     sidecar_cmd.kill()?;
@@ -181,12 +251,11 @@ struct Metrics {
     peak_cpu: f64,
 }
 
-async fn monitor_process(pid: u32, duration_seconds: u32) -> Result<Metrics> {
-
+async fn monitor_process(pid: u32, duration_seconds: f64) -> Result<Metrics> {
     let mut ram_values = Vec::new();
     let mut cpu_values = Vec::new();
 
-    for _ in 0..duration_seconds {
+    for _ in 0..(duration_seconds as u32) {
         let output = Command::new("ps")
             .args(&["-p", &pid.to_string(), "-o", "rss,%cpu"])
             .output()?;
@@ -232,9 +301,7 @@ fn generate_ca() -> (rcgen::Certificate, Issuer<'static, KeyPair>) {
     (cert, issuer)
 }
 
-fn generate_server_cert(
-    issuer: &Issuer<KeyPair>,
-) -> (rcgen::Certificate, KeyPair) {
+fn generate_server_cert(issuer: &Issuer<KeyPair>) -> (rcgen::Certificate, KeyPair) {
     let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params
         .distinguished_name
@@ -250,9 +317,7 @@ fn generate_server_cert(
     (cert, key_pair)
 }
 
-fn generate_client_cert(
-    issuer: &Issuer<KeyPair>,
-) -> (rcgen::Certificate, KeyPair) {
+fn generate_client_cert(issuer: &Issuer<KeyPair>) -> (rcgen::Certificate, KeyPair) {
     let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params.distinguished_name.push(DnType::CommonName, "client");
     params
@@ -273,7 +338,15 @@ fn validity_period() -> (OffsetDateTime, OffsetDateTime) {
     (yesterday, tomorrow)
 }
 
-async fn run_load_test(sidecar_port: u16, client_cert_path: &std::path::Path, client_key_path: &std::path::Path, ca_dir: &std::path::Path, duration_seconds: u32) -> Result<()> {
+async fn run_load_test(
+    sidecar_port: u16,
+    client_cert_path: &std::path::Path,
+    client_key_path: &std::path::Path,
+    ca_dir: &std::path::Path,
+    duration_seconds: f64,
+    num_clients: usize,
+    requests_per_second: f64,
+) -> Result<()> {
     let ca_cert = std::fs::read(ca_dir.join("ca-bundle.crt"))?;
     let client_cert = std::fs::read(client_cert_path)?;
     let client_key = std::fs::read(client_key_path)?;
@@ -287,17 +360,18 @@ async fn run_load_test(sidecar_port: u16, client_cert_path: &std::path::Path, cl
 
     let url = format!("https://localhost:{}/", sidecar_port);
 
-    // Spawn 100 concurrent clients, each sending ~10 req/s
-    let num_clients = 100;
-    let requests_per_second = 10;
+    // Spawn concurrent clients
     let mut handles = Vec::new();
+    let delay = Duration::from_micros(
+        (1_000_000.0 / requests_per_second) as u64,
+    );
     for _ in 0..num_clients {
         let client = client.clone();
         let url = url.clone();
         let handle = tokio::spawn(async move {
-            for _ in 0..(requests_per_second * duration_seconds) {
+            for _ in 0..((requests_per_second * duration_seconds).round() as u32) {
                 let _ = client.get(&url).send().await;
-                sleep(Duration::from_millis((1000 / requests_per_second).into())).await;
+                sleep(delay).await;
             }
         });
         handles.push(handle);
@@ -316,7 +390,10 @@ fn update_readme(avg_ram: f64, peak_ram: f64, avg_cpu: f64, peak_cpu: f64) -> Re
     let content = std::fs::read_to_string(readme_path)?;
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
     let target_prefix = "- Low overhead: ";
-    if let Some(index) = lines.iter().position(|line| line.starts_with(target_prefix)) {
+    if let Some(index) = lines
+        .iter()
+        .position(|line| line.starts_with(target_prefix))
+    {
         lines[index] = format!("- Low overhead: <{:.0}MB RAM, <{:.1}% CPU at 1k req/s (avg {:.1}MB RAM, peak {:.1}MB RAM, avg {:.1}% CPU, peak {:.1}% CPU)",
                                peak_ram.ceil(), peak_cpu.ceil(), avg_ram, peak_ram, avg_cpu, peak_cpu);
     }
