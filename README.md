@@ -28,7 +28,7 @@ proxy for secure outbound connections.
 - Hot-reloads TLS configuration on file changes.
   - Supports both `kubernetes.io/tls` and VSO Opaque Secret formats via file auto-detection.
 - Supports HTTP/1.1 and HTTP/2 proxying, enabling mTLS termination for gRPC services.
-- Low overhead: <19MB RAM, <16.0% CPU at 1k req/s (avg 17.0MB RAM, peak 18.6MB RAM, avg 12.6% CPU, peak 15.3% CPU)
+- Low overhead: <14MB RAM, <8.0% CPU at 1k req/s (avg 12.7MB RAM, peak 13.3MB RAM, avg 5.1% CPU, peak 7.4% CPU)
 - Dedicated monitoring port for health probes (including server certificate expiry validation) and optional Prometheus metrics.
 - Structured JSON logging for requests, reloads, and errors.
 - Graceful shutdown.

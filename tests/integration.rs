@@ -40,6 +40,7 @@ pub mod hello_world {
 
 use hello_world::greeter_server::{Greeter, GreeterServer};
 use hello_world::{HelloReply, HelloRequest};
+use mtls_sidecar::client_cert::HeaderInjector;
 use mtls_sidecar::utils::adapt_request;
 
 #[derive(Default)]
@@ -359,25 +360,25 @@ async fn start_sidecar(config: &Config, tls_manager: Arc<TlsManager>) -> Result<
                 let acceptor = TlsAcceptor::from(current_config);
                 let stream = acceptor.accept(stream).await.unwrap();
                 let (_, server_conn) = stream.get_ref();
-                let client_cert = server_conn
+                let mut inj = HeaderInjector::new();
+                if let Some(cert) = server_conn
                     .peer_certificates()
                     .and_then(|certs| certs.first().cloned())
-                    .and_then(|cert| Some(Arc::new(cert)));
-                let service = service_fn(move |mut req| {
-                    if let Some(cert) = &client_cert {
-                        req.extensions_mut().insert(cert.clone());
-                    }
+                {
+                    inj.parse_client_cert(&cert)
+                }
+                let inj = Arc::new(inj);
+                let service = service_fn(move |req| {
                     let up = upstream.clone();
+                    let inj = Arc::clone(&inj);
                     let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    let cc = client_cert.clone().and_then(|cert| Some(Arc::clone(&cert)));
                     async move {
                         mtls_sidecar::proxy_inbound::handler(
                             adapt_request(req),
                             &up,
-                            inject,
                             client,
                             peer_addr,
-                            cc,
+                            inj,
                         )
                         .await
                     }
@@ -762,7 +763,6 @@ async fn test_outbound_proxy_connect_data_transmission() -> Result<()> {
 
 #[tokio::test]
 async fn test_outbound_proxy_upgrade() -> Result<()> {
-
     // Create client cert dir
     let test_certs = setup_certificates()?;
     let client_cert_dir = test_certs._temp_dir.path().join("client-certs");
@@ -841,7 +841,10 @@ async fn test_outbound_proxy_upgrade() -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Connect to outbound proxy and send upgrade request
-    println!("Connecting to outbound proxy on port {}", outbound_proxy_port);
+    println!(
+        "Connecting to outbound proxy on port {}",
+        outbound_proxy_port
+    );
     let stream = TcpStream::connect(format!("127.0.0.1:{}", outbound_proxy_port)).await?;
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
     tokio::spawn(async move {
@@ -966,31 +969,29 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                 let (_, server_conn) = stream.get_ref();
                 let client_cert = server_conn
                     .peer_certificates()
+                    .and_then(|certs| certs.first().cloned());;
+                let mut inj = HeaderInjector::new();
+                if let Some(cert) = server_conn
+                    .peer_certificates()
                     .and_then(|certs| certs.first().cloned())
-                    .and_then(|cert| Some(Arc::new(cert)));
+                {
+                    inj.parse_client_cert(&cert)
+                }
+                let inj = Arc::new(inj);
                 let service = service_fn(move |mut req| {
                     if let Some(cert) = &client_cert {
                         req.extensions_mut().insert(cert.clone());
                     }
                     let up = upstream.clone();
-                    // For gRPC test, use HTTP/2 capable client
-                    let client = if up.contains("grpc") {
-                        Arc::new(
-                            Client::builder(TokioExecutor::new())
-                                .build(hyper_util::client::legacy::connect::HttpConnector::new()),
-                        )
-                    } else {
-                        Arc::new(Client::builder(TokioExecutor::new()).build_http())
-                    };
-                    let cc = client_cert.clone().and_then(|cert| Some(Arc::clone(&cert)));
+                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+                    let inj = Arc::clone(&inj);
                     async move {
                         mtls_sidecar::proxy_inbound::handler(
                             adapt_request(req),
                             &up,
-                            false,
                             client,
                             peer_addr,
-                            cc,
+                            inj,
                         )
                         .await
                     }

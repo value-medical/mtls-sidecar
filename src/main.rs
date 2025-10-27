@@ -16,6 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_rustls::TlsAcceptor;
 
+use mtls_sidecar::client_cert::HeaderInjector;
 use mtls_sidecar::error::{DomainError, DynError};
 use mtls_sidecar::utils::adapt_request;
 use mtls_sidecar::{config, monitoring, proxy_inbound, tls_manager, watcher};
@@ -144,16 +145,22 @@ async fn accept_inbound_connection(
     tracing::info!("Client connected");
 
     let (_, server_conn) = stream.get_ref();
-    let client_cert = server_conn
-        .peer_certificates()
-        .and_then(|certs| certs.first().cloned())
-        .and_then(|cert| Some(Arc::new(cert)));
+    let mut inj = HeaderInjector::new();
+    if inject {
+        if let Some(cert) = server_conn
+            .peer_certificates()
+            .and_then(|certs| certs.first().cloned())
+        {
+            inj.parse_client_cert(&cert)
+        }
+    }
+    let inj = Arc::new(inj);
 
     let service = service_fn(move |req: Request<Incoming>| {
         let up = upstream_url.clone();
         let cli = Arc::clone(&client);
-        let cc = client_cert.clone().and_then(|cert| Some(Arc::clone(&cert)));
-        async move { proxy_inbound::handler(adapt_request(req), &up, inject, cli, peer_addr, cc).await }
+        let inj = Arc::clone(&inj);
+        async move { proxy_inbound::handler(adapt_request(req), &up, cli, peer_addr, inj).await }
     });
 
     if let Err(err) = auto::Builder::new(TokioExecutor::new())

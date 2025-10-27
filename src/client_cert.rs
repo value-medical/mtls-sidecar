@@ -6,62 +6,80 @@ use x509_parser::extensions::{GeneralName, SubjectAlternativeName};
 use x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME;
 use x509_parser::prelude::*;
 
-/// Injects client certificate header into the upstream request builder.
-/// Extracts key details from the client certificate and injects them as a base64-encoded JSON
-/// object in the X-Client-TLS-Info header, as per the specification.
-pub fn inject_client_headers(
-    mut upstream_req_builder: hyper::http::request::Builder,
-    cert_der: &rustls::pki_types::CertificateDer<'static>,
-) -> hyper::http::request::Builder {
-    if let Ok((_, cert)) = X509Certificate::from_der(cert_der.as_ref()) {
-        let subject = cert.subject().to_string();
+pub struct HeaderInjector {
+    valid: bool,
+    headers: Vec<(&'static str, String)>,
+}
 
-        let mut uri_sans = Vec::new();
-        let mut dns_sans = Vec::new();
-        if let Some(san_ext) = cert
-            .extensions()
-            .iter()
-            .find(|e| e.oid == OID_X509_EXT_SUBJECT_ALT_NAME)
-        {
-            if let Ok((_, san)) = SubjectAlternativeName::from_der(san_ext.value) {
-                for gn in &san.general_names {
-                    match gn {
-                        GeneralName::URI(uri) => uri_sans.push(uri.to_string()),
-                        GeneralName::DNSName(dns) => dns_sans.push(dns.to_string()),
-                        _ => {}
+impl HeaderInjector {
+    pub fn new() -> Self {
+        HeaderInjector {
+            valid: false,
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    pub fn inject(&self, mut builder: http::request::Builder) -> http::request::Builder {
+        for (key, value) in &self.headers {
+            builder = builder.header(*key, value.as_str());
+        }
+        builder
+    }
+
+    pub fn parse_client_cert(&mut self, cert_der: &rustls::pki_types::CertificateDer<'static>) {
+        if let Ok((_, cert)) = X509Certificate::from_der(cert_der.as_ref()) {
+            let subject = cert.subject().to_string();
+
+            let mut uri_sans = Vec::new();
+            let mut dns_sans = Vec::new();
+            if let Some(san_ext) = cert
+                .extensions()
+                .iter()
+                .find(|e| e.oid == OID_X509_EXT_SUBJECT_ALT_NAME)
+            {
+                if let Ok((_, san)) = SubjectAlternativeName::from_der(san_ext.value) {
+                    for gn in &san.general_names {
+                        match gn {
+                            GeneralName::URI(uri) => uri_sans.push(uri.to_string()),
+                            GeneralName::DNSName(dns) => dns_sans.push(dns.to_string()),
+                            _ => {}
+                        }
                     }
                 }
             }
+
+            let hash = {
+                let mut hasher = Sha256::new();
+                hasher.update(cert_der.as_ref());
+                format!("sha256:{:x}", hasher.finalize())
+            };
+
+            let not_before = cert.validity().not_before.to_string();
+            let not_after = cert.validity().not_after.to_string();
+
+            let serial = format!("0x{:x}", cert.serial);
+
+            let json_obj = json!({
+                "subject": subject,
+                "uri_sans": uri_sans,
+                "dns_sans": dns_sans,
+                "hash": hash,
+                "not_before": not_before,
+                "not_after": not_after,
+                "serial": serial,
+            });
+
+            let json_str = json_obj.to_string();
+            let b64 = base64::engine::general_purpose::STANDARD.encode(json_str.as_bytes());
+
+            self.valid = true;
+            self.headers.push(("X-Client-TLS-Info", b64));
         }
-
-        let hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(cert_der.as_ref());
-            format!("sha256:{:x}", hasher.finalize())
-        };
-
-        let not_before = cert.validity().not_before.to_string();
-        let not_after = cert.validity().not_after.to_string();
-
-        let serial = format!("0x{:x}", cert.serial);
-
-        let json_obj = json!({
-            "subject": subject,
-            "uri_sans": uri_sans,
-            "dns_sans": dns_sans,
-            "hash": hash,
-            "not_before": not_before,
-            "not_after": not_after,
-            "serial": serial,
-        });
-
-        let json_str = json_obj.to_string();
-        let b64 = base64::engine::general_purpose::STANDARD.encode(json_str.as_bytes());
-
-        upstream_req_builder = upstream_req_builder.header("X-Client-TLS-Info", b64);
-        tracing::info!("Injected client TLS info header");
     }
-    upstream_req_builder
 }
 
 #[cfg(test)]
@@ -84,16 +102,18 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
 
-        let builder = hyper::Request::builder();
-        let result_builder = inject_client_headers(builder, &cert_der);
+        let mut inj = HeaderInjector::new();
+        inj.parse_client_cert(&cert_der);
 
-        let req = result_builder.body(()).unwrap();
-        let header_value = req
-            .headers()
-            .get("X-Client-TLS-Info")
+        assert!(inj.valid);
+        let header_value = inj
+            .headers
+            .iter()
+            .filter(|(k, _)| *k == "X-Client-TLS-Info")
+            .next()
             .unwrap()
-            .to_str()
-            .unwrap();
+            .1
+            .as_str();
 
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(header_value)
@@ -124,16 +144,18 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
 
-        let builder = hyper::Request::builder();
-        let result_builder = inject_client_headers(builder, &cert_der);
+        let mut inj = HeaderInjector::new();
+        inj.parse_client_cert(&cert_der);
 
-        let req = result_builder.body(()).unwrap();
-        let header_value = req
-            .headers()
-            .get("X-Client-TLS-Info")
+        assert!(inj.valid);
+        let header_value = inj
+            .headers
+            .iter()
+            .filter(|(k, _)| *k == "X-Client-TLS-Info")
+            .next()
             .unwrap()
-            .to_str()
-            .unwrap();
+            .1
+            .as_str();
 
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(header_value)
@@ -153,11 +175,17 @@ mod tests {
         // Test with invalid certificate data
         let invalid_der = rustls::pki_types::CertificateDer::from(vec![0, 1, 2, 3]);
 
-        let builder = hyper::Request::builder();
-        let result_builder = inject_client_headers(builder, &invalid_der);
+        let mut inj = HeaderInjector::new();
+        inj.parse_client_cert(&invalid_der);
 
-        let req = result_builder.body(()).unwrap();
         // Should not have the header since parsing failed
-        assert!(req.headers().get("X-Client-TLS-Info").is_none());
+        assert!(!inj.valid);
+        assert!(inj
+            .headers
+            .iter()
+            .filter(|(k, _)| *k == "X-Client-TLS-Info")
+            .next()
+            .is_none());
     }
+
 }

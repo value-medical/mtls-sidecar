@@ -1,4 +1,8 @@
+use crate::client_cert::HeaderInjector;
 use crate::error::{DomainError, DynError};
+use crate::header_filter;
+use crate::http_client_like::HttpClientLike;
+use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
 use anyhow::{Error, Result};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -7,18 +11,12 @@ use hyper::header::HOST;
 use hyper::{http::Uri, Request, Response, StatusCode};
 use std::sync::Arc;
 
-use crate::client_cert;
-use crate::header_filter;
-use crate::http_client_like::HttpClientLike;
-use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
-
 pub async fn handler<C>(
     req: Request<BoxBody<Bytes, DynError>>,
     upstream_url: &str,
-    inject_client_headers: bool,
     client: C,
     client_addr: Option<std::net::SocketAddr>,
-    client_cert: Option<Arc<rustls::pki_types::CertificateDer<'static>>>,
+    injector: Arc<HeaderInjector>,
 ) -> Result<Response<BoxBody<Bytes, DynError>>, Error>
 where
     C: HttpClientLike,
@@ -35,7 +33,7 @@ where
     }
 
     // Require client cert
-    if client_cert.is_none() {
+    if !injector.is_valid() {
         tracing::warn!("Missing client certificate");
         // No cert, return 401
         MTLS_FAILURES_TOTAL.inc();
@@ -69,12 +67,7 @@ where
     }
 
     // If inject_client_headers, parse cert and add headers
-    if inject_client_headers {
-        if let Some(cert_der) = &client_cert {
-            upstream_req_builder =
-                client_cert::inject_client_headers(upstream_req_builder, cert_der);
-        }
-    }
+    upstream_req_builder = injector.inject(upstream_req_builder);
 
     // Override host header
     // We only support http upstreams, our purpose is to terminate TLS.
@@ -176,8 +169,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_missing_cert() {
-        let req = Request::new(BoxBody::new(Empty::<Bytes>::new().map_err(Into::<DynError>::into)));
-        let resp = handler(req, "http://localhost:8080", false, MockClient, None, None)
+        let req = Request::new(BoxBody::new(
+            Empty::<Bytes>::new().map_err(Into::<DynError>::into),
+        ));
+
+        let resp = handler(req, "http://localhost:8080", MockClient, None, Arc::new(HeaderInjector::new()))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -196,15 +192,18 @@ mod tests {
         let key_pair = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let mut inj = HeaderInjector::new();
+        inj.parse_client_cert(&cert_der);
 
-        let req = Request::new(BoxBody::new(Empty::<Bytes>::new().map_err(Into::<DynError>::into)));
+        let req = Request::new(BoxBody::new(
+            Empty::<Bytes>::new().map_err(Into::<DynError>::into),
+        ));
         let result = handler(
             req,
             "http://localhost:8080",
-            false,
             MockClient,
             None,
-            Some(Arc::new(cert_der)),
+            Arc::new(inj),
         )
         .await;
         assert!(result.is_ok());
@@ -219,7 +218,9 @@ mod tests {
             captured_headers: captured.clone(),
         };
 
-        let mut req = Request::new(BoxBody::new(Empty::<Bytes>::new().map_err(Into::<DynError>::into)));
+        let mut req = Request::new(BoxBody::new(
+            Empty::<Bytes>::new().map_err(Into::<DynError>::into),
+        ));
         req.headers_mut()
             .insert("x-client-test", "value".parse().unwrap());
         req.headers_mut()
@@ -233,14 +234,15 @@ mod tests {
         let key_pair = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let mut inj = HeaderInjector::new();
+        inj.parse_client_cert(&cert_der);
 
         let result = handler(
             req,
             "http://localhost:8080",
-            false,
             client,
             None,
-            Some(Arc::new(cert_der)),
+            Arc::new(inj),
         )
         .await;
         assert!(result.is_ok());
@@ -261,7 +263,9 @@ mod tests {
             captured_headers: captured.clone(),
         };
 
-        let mut req = Request::new(BoxBody::new(Empty::<Bytes>::new().map_err(Into::<DynError>::into)));
+        let mut req = Request::new(BoxBody::new(
+            Empty::<Bytes>::new().map_err(Into::<DynError>::into),
+        ));
         req.headers_mut()
             .insert("x-client-test", "value".parse().unwrap());
 
@@ -276,14 +280,15 @@ mod tests {
         let key_pair = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let mut inj = HeaderInjector::new();
+        inj.parse_client_cert(&cert_der);
 
         let result = handler(
             req,
             "http://localhost:8080",
-            true,
             client,
             None,
-            Some(Arc::new(cert_der)),
+            Arc::new(inj),
         )
         .await;
         assert!(result.is_ok());
