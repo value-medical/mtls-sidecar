@@ -49,15 +49,6 @@ async fn main() -> Result<()> {
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
         .expect("Failed to install rustls crypto provider");
 
-    // Build sidecar in release mode if not already
-    println!("Building sidecar in release mode...");
-    let status = Command::new("cargo")
-        .args(&["build", "--release"])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("Failed to build sidecar");
-    }
-
     let mut results = Vec::new();
     let num_runs = args.runs;
     for run in 1..=num_runs {
