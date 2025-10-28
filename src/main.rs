@@ -1,10 +1,8 @@
 use anyhow::{Context, Error, Result};
-use bytes::Bytes;
 use http::Request;
-use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use std::io;
@@ -14,12 +12,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio_rustls::TlsAcceptor;
 
-use mtls_sidecar::client_cert::HeaderInjector;
-use mtls_sidecar::error::{DomainError, DynError};
+use mtls_sidecar::error::DomainError;
 use mtls_sidecar::utils::adapt_request;
-use mtls_sidecar::{config, monitoring, proxy_inbound, tls_manager, watcher};
+use mtls_sidecar::{config, monitoring, tls_manager, watcher};
 use tls_manager::TlsManager;
 
 fn setup_crypto_provider() {
@@ -118,58 +114,6 @@ async fn accept_outbound_connection(stream: TcpStream, tls_manager: Arc<TlsManag
     }
 }
 
-async fn accept_inbound_connection(
-    stream: TcpStream,
-    tls_manager: Arc<TlsManager>,
-    upstream_url: String,
-    inject: bool,
-    client: Arc<Client<HttpConnector, BoxBody<Bytes, DynError>>>,
-) {
-    let peer_addr = stream.peer_addr().ok();
-    let current_config = tls_manager
-        .server_config
-        .read()
-        .await
-        .as_ref()
-        .unwrap()
-        .clone();
-    let acceptor = TlsAcceptor::from(current_config);
-
-    let stream = match acceptor.accept(stream).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("TLS handshake failed: {:?}", e);
-            return;
-        }
-    };
-    tracing::info!("Client connected");
-
-    let (_, server_conn) = stream.get_ref();
-    let mut inj = HeaderInjector::new();
-    if inject {
-        if let Some(cert) = server_conn
-            .peer_certificates()
-            .and_then(|certs| certs.first().cloned())
-        {
-            inj.parse_client_cert(&cert)
-        }
-    }
-    let inj = Arc::new(inj);
-
-    let service = service_fn(move |req: Request<Incoming>| {
-        let up = upstream_url.clone();
-        let cli = Arc::clone(&client);
-        let inj = Arc::clone(&inj);
-        async move { proxy_inbound::handler(adapt_request(req), &up, cli, peer_addr, inj).await }
-    });
-
-    if let Err(err) = auto::Builder::new(TokioExecutor::new())
-        .serve_connection(TokioIo::new(stream), service)
-        .await
-    {
-        tracing::error!("Error serving connection: {:?}", err);
-    }
-}
 
 fn maybe_accept(
     listener: &Option<TcpListener>,
@@ -260,7 +204,7 @@ async fn main() -> Result<(), Error> {
                         let client = Arc::clone(&http_client);
                         let active_conn = Arc::clone(&active_connections);
                         tokio::spawn(async move {
-                            accept_inbound_connection(stream, tls_mgr, upstream, inject, client).await;
+                            mtls_sidecar::proxy_inbound::accept_connection(stream, tls_mgr, upstream, inject, client).await;
                             active_conn.fetch_sub(1, Ordering::Relaxed);
                         });
                     }

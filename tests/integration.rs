@@ -203,7 +203,7 @@ async fn setup_test(
     ));
     let tls_manager = Arc::new(TlsManager::new());
     tls_manager.reload(&config).await?;
-    start_sidecar(&config, Arc::clone(&tls_manager)).await?;
+    start_sidecar(&config, Arc::clone(&tls_manager), inject_headers).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     let client = create_client_builder_with_cert(&test_certs)?.build()?;
     let setup = TestSetup {
@@ -344,49 +344,24 @@ async fn start_https_upstream(port: u16, response: Bytes, cert_dir: &PathBuf) ->
     Ok(())
 }
 
-async fn start_sidecar(config: &Config, tls_manager: Arc<TlsManager>) -> Result<()> {
+async fn start_sidecar(config: &Config, tls_manager: Arc<TlsManager>, inject_headers: bool) -> Result<()> {
     let sidecar_listener =
         TcpListener::bind(format!("127.0.0.1:{}", config.tls_listen_port.unwrap())).await?;
     let upstream_url = config.upstream_url.clone().unwrap();
+
+    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
+    let tls_manager_for_sidecar = Arc::clone(&tls_manager);
     tokio::spawn(async move {
         loop {
             let (stream, _) = sidecar_listener.accept().await.unwrap();
-            let peer_addr = stream.peer_addr().ok();
-            let upstream = upstream_url.clone();
-            let tls_manager = Arc::clone(&tls_manager);
-            tokio::spawn(async move {
-                let current_config = tls_manager.server_config.read().await.clone().unwrap();
-                let acceptor = TlsAcceptor::from(current_config);
-                let stream = acceptor.accept(stream).await.unwrap();
-                let (_, server_conn) = stream.get_ref();
-                let mut inj = HeaderInjector::new();
-                if let Some(cert) = server_conn
-                    .peer_certificates()
-                    .and_then(|certs| certs.first().cloned())
-                {
-                    inj.parse_client_cert(&cert)
-                }
-                let inj = Arc::new(inj);
-                let service = service_fn(move |req| {
-                    let up = upstream.clone();
-                    let inj = Arc::clone(&inj);
-                    let client = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-                    async move {
-                        mtls_sidecar::proxy_inbound::handler(
-                            adapt_request(req),
-                            &up,
-                            client,
-                            peer_addr,
-                            inj,
-                        )
-                        .await
-                    }
-                });
-                auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                    .unwrap();
-            });
+            mtls_sidecar::proxy_inbound::accept_connection(
+                stream,
+                Arc::clone(&tls_manager_for_sidecar),
+                upstream_url.clone(),
+                inject_headers,
+                Arc::clone(&client),
+            )
+                .await;
         }
     });
     Ok(())
@@ -490,7 +465,7 @@ async fn test_file_watching_reload() -> Result<()> {
     });
 
     // Spawn server
-    start_sidecar(&config, Arc::clone(&tls_manager)).await?;
+    start_sidecar(&config, Arc::clone(&tls_manager), config.inject_client_headers).await?;
 
     // Wait for server to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -1241,7 +1216,7 @@ async fn test_proxy_grpc() -> Result<()> {
     tls_manager.reload(&config).await?;
 
     // Spawn server
-    start_sidecar(&config, Arc::clone(&tls_manager)).await?;
+    start_sidecar(&config, Arc::clone(&tls_manager), config.inject_client_headers).await?;
 
     // Wait a bit for servers to start
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;

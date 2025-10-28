@@ -3,13 +3,75 @@ use crate::error::{DomainError, DynError};
 use crate::header_filter;
 use crate::http_client_like::HttpClientLike;
 use crate::monitoring::{MTLS_FAILURES_TOTAL, REQUESTS_TOTAL};
+use crate::tls_manager::TlsManager;
+use crate::utils::adapt_request;
 use anyhow::{Error, Result};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
 use hyper::header::HOST;
 use hyper::{http::Uri, Request, Response, StatusCode};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use hyper::service::service_fn;
 use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsAcceptor;
+
+pub async fn accept_connection(
+    stream: TcpStream,
+    tls_manager: Arc<TlsManager>,
+    upstream_url: String,
+    inject: bool,
+    client: Arc<Client<HttpConnector, BoxBody<Bytes, DynError>>>,
+) {
+    let peer_addr = stream.peer_addr().ok();
+    let current_config = tls_manager
+        .server_config
+        .read()
+        .await
+        .as_ref()
+        .unwrap()
+        .clone();
+    let acceptor = TlsAcceptor::from(current_config);
+
+    let stream = match acceptor.accept(stream).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("TLS handshake failed: {:?}", e);
+            return;
+        }
+    };
+    tracing::info!("Client connected");
+
+    let (_, server_conn) = stream.get_ref();
+    let mut inj = HeaderInjector::new();
+    if inject {
+        if let Some(cert) = server_conn
+            .peer_certificates()
+            .and_then(|certs| certs.first().cloned())
+        {
+            inj.parse_client_cert(&cert)
+        }
+    }
+    let inj = Arc::new(inj);
+
+    let service = service_fn(move |req: Request<Incoming>| {
+        let up = upstream_url.clone();
+        let cli = Arc::clone(&client);
+        let inj = Arc::clone(&inj);
+        async move { handler(adapt_request(req), &up, cli, peer_addr, inj).await }
+    });
+
+    if let Err(err) = auto::Builder::new(TokioExecutor::new())
+        .serve_connection(TokioIo::new(stream), service)
+        .await
+    {
+        tracing::error!("Error serving connection: {:?}", err);
+    }
+}
 
 pub async fn handler<C>(
     req: Request<BoxBody<Bytes, DynError>>,
