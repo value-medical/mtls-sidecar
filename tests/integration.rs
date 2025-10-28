@@ -434,14 +434,17 @@ async fn test_proxy_with_header_injection() -> Result<()> {
 
 #[tokio::test]
 async fn test_file_watching_reload() -> Result<()> {
+    println!("Starting test_file_watching_reload");
     let (upstream_port, sidecar_port, monitor_port) = pick_ports();
 
     let mut test_certs = setup_certificates()?;
+    println!("Certificates set up");
 
     // Start mock upstream
     start_basic_upstream(upstream_port, Bytes::from("OK")).await?;
+    println!("Upstream started on port {}", upstream_port);
 
-    // Start sidecar
+    // Create config and TLS manager
     let config = Arc::new(create_test_config(
         upstream_port,
         sidecar_port,
@@ -456,6 +459,7 @@ async fn test_file_watching_reload() -> Result<()> {
     let watcher_config = Arc::clone(&config);
     let watcher_tls_manager = Arc::clone(&tls_manager);
     let reload_tls_manager = Arc::clone(&tls_manager);
+    println!("Configuration and TLS manager set up");
 
     // Spawn watcher
     tokio::spawn(async move {
@@ -463,24 +467,30 @@ async fn test_file_watching_reload() -> Result<()> {
             .await
             .unwrap();
     });
+    println!("Watcher spawned");
 
     // Spawn server
     start_sidecar(&config, Arc::clone(&tls_manager), config.inject_client_headers).await?;
+    println!("Sidecar started");
 
     // Wait for server to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    println!("Sidecar started on port {}", sidecar_port);
 
     // Make initial request with old client cert
     let old_client = create_client_builder_with_cert(&test_certs)?.build()?;
     let resp = old_client
         .get(format!("https://localhost:{}/", sidecar_port))
+        .header("Connection", "close") // Ensure connection closes to avoid reuse issues
         .send()
         .await?;
+    println!("Initial request status: {}", resp.status());
     assert_eq!(resp.status(), 200);
 
     // Generate new certs
     let (new_ca_cert, issuer) = generate_ca();
     let (new_server_cert, new_server_key) = generate_server_cert(&issuer);
+    println!("Renewed CA and server certificates");
 
     // Overwrite cert files to trigger reload
     std::fs::write(test_certs.cert_dir.join("tls.crt"), new_server_cert.pem())?;
@@ -489,20 +499,25 @@ async fn test_file_watching_reload() -> Result<()> {
         new_server_key.serialize_pem(),
     )?;
     std::fs::write(test_certs.ca_dir.join("ca-bundle.crt"), new_ca_cert.pem())?;
+    println!("Written new certs to disk");
 
     // Manually trigger reload to ensure it works (file watching may not trigger in test env)
     reload_tls_manager.reload(&config).await?;
+    println!("TLS config reloaded with new certs");
 
     // Wait a bit
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    println!("Waited for reload to take effect");
 
     // Try old client again - should fail because server now requires client cert verified by new CA
     test_certs.ca_cert = new_ca_cert;
     let old_client_permissive = create_client_builder_with_cert(&test_certs)?.build()?;
+    println!("Client permissive created, about to send request");
     let result = old_client_permissive
         .get(format!("https://localhost:{}/", sidecar_port))
         .send()
         .await;
+    println!("Status after CA cert rotation: {:?}", result);
     assert!(
         result.is_err(),
         "Old client cert should be rejected by new CA"
@@ -519,6 +534,7 @@ async fn test_file_watching_reload() -> Result<()> {
         .get(format!("https://localhost:{}/", sidecar_port))
         .send()
         .await?;
+    println!("Status after client cert renewed: {:?}", result);
     assert_eq!(resp.status(), 200);
 
     Ok(())
