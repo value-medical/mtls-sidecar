@@ -348,7 +348,6 @@ async fn start_sidecar(config: &Config, tls_manager: Arc<TlsManager>) -> Result<
     let sidecar_listener =
         TcpListener::bind(format!("127.0.0.1:{}", config.tls_listen_port.unwrap())).await?;
     let upstream_url = config.upstream_url.clone().unwrap();
-    let inject = config.inject_client_headers;
     tokio::spawn(async move {
         loop {
             let (stream, _) = sidecar_listener.accept().await.unwrap();
@@ -969,7 +968,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                 let (_, server_conn) = stream.get_ref();
                 let client_cert = server_conn
                     .peer_certificates()
-                    .and_then(|certs| certs.first().cloned());;
+                    .and_then(|certs| certs.first().cloned());
                 let mut inj = HeaderInjector::new();
                 if let Some(cert) = server_conn
                     .peer_certificates()

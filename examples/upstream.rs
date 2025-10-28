@@ -4,6 +4,7 @@ use axum::Router;
 use base64::Engine;
 use tokio::net::TcpListener;
 
+#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 struct ClientTLSInfo {
     subject: String,
