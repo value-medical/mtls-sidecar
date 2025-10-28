@@ -949,7 +949,7 @@ async fn test_tls_handshake_failure_handling() -> Result<()> {
                     .peer_certificates()
                     .and_then(|certs| certs.first().cloned())
                 {
-                    inj.parse_client_cert(&cert)
+                    inj.parse_client_cert(&cert, true)
                 }
                 let inj = Arc::new(inj);
                 let service = service_fn(move |mut req| {

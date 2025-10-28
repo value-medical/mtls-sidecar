@@ -30,8 +30,15 @@ impl HeaderInjector {
         builder
     }
 
-    pub fn parse_client_cert(&mut self, cert_der: &rustls::pki_types::CertificateDer<'static>) {
+    pub fn parse_client_cert(&mut self, cert_der: &rustls::pki_types::CertificateDer<'static>, extract_headers: bool) {
         if let Ok((_, cert)) = X509Certificate::from_der(cert_der.as_ref()) {
+            self.valid = true;
+
+            // Extract headers only if requested
+            if !extract_headers {
+                return;
+            }
+
             let subject = cert.subject().to_string();
 
             let mut uri_sans = Vec::new();
@@ -76,7 +83,6 @@ impl HeaderInjector {
             let json_str = json_obj.to_string();
             let b64 = base64::engine::general_purpose::STANDARD.encode(json_str.as_bytes());
 
-            self.valid = true;
             self.headers.push(("X-Client-TLS-Info", b64));
         }
     }
@@ -103,7 +109,7 @@ mod tests {
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
 
         let mut inj = HeaderInjector::new();
-        inj.parse_client_cert(&cert_der);
+        inj.parse_client_cert(&cert_der, true);
 
         assert!(inj.valid);
         let header_value = inj
@@ -145,7 +151,7 @@ mod tests {
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
 
         let mut inj = HeaderInjector::new();
-        inj.parse_client_cert(&cert_der);
+        inj.parse_client_cert(&cert_der, true);
 
         assert!(inj.valid);
         let header_value = inj
@@ -176,7 +182,7 @@ mod tests {
         let invalid_der = rustls::pki_types::CertificateDer::from(vec![0, 1, 2, 3]);
 
         let mut inj = HeaderInjector::new();
-        inj.parse_client_cert(&invalid_der);
+        inj.parse_client_cert(&invalid_der, true);
 
         // Should not have the header since parsing failed
         assert!(!inj.valid);

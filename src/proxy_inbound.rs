@@ -48,13 +48,11 @@ pub async fn accept_connection(
 
     let (_, server_conn) = stream.get_ref();
     let mut inj = HeaderInjector::new();
-    if inject {
-        if let Some(cert) = server_conn
-            .peer_certificates()
-            .and_then(|certs| certs.first().cloned())
-        {
-            inj.parse_client_cert(&cert)
-        }
+    if let Some(cert) = server_conn
+        .peer_certificates()
+        .and_then(|certs| certs.first().cloned())
+    {
+        inj.parse_client_cert(&cert, inject)
     }
     let inj = Arc::new(inj);
 
@@ -255,7 +253,7 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
         let mut inj = HeaderInjector::new();
-        inj.parse_client_cert(&cert_der);
+        inj.parse_client_cert(&cert_der, true);
 
         let req = Request::new(BoxBody::new(
             Empty::<Bytes>::new().map_err(Into::<DynError>::into),
@@ -297,7 +295,7 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
         let mut inj = HeaderInjector::new();
-        inj.parse_client_cert(&cert_der);
+        inj.parse_client_cert(&cert_der, true);
 
         let result = handler(
             req,
@@ -343,7 +341,7 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
         let mut inj = HeaderInjector::new();
-        inj.parse_client_cert(&cert_der);
+        inj.parse_client_cert(&cert_der, true);
 
         let result = handler(
             req,
